@@ -63,8 +63,8 @@ tts_max_speed: 1.35
 f5_ckpt_dir: "{{ playbook_dir }}/models/f5_czech"
 tts_engine: auto
 
-# Czech F5 fine-tune
-f5_train_dataset: mozilla-foundation/common_voice_17_0
+# Czech F5 fine-tune (VoxPopuli Czech; Common Voice is no longer on Hugging Face)
+f5_train_dataset: facebook/voxpopuli
 f5_train_dataset_config: cs
 f5_train_dataset_split: train
 f5_train_local_dir: ""
@@ -79,7 +79,7 @@ f5_data_dir: "{{ playbook_dir }}/data/f5_czech"
 f5_train_min_seconds: 1.0
 f5_train_max_seconds: 12.0
 f5_train_dataset_name: czech
-f5_train_text_column: sentence
+f5_train_text_column: raw_text
 f5_train_audio_column: audio
 f5_train_smoke_text: "Za svítání šel dům přes louku."
 

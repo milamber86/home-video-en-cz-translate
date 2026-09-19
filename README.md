@@ -103,7 +103,9 @@ Fine-tune from `F5TTS_v1_Base` (never from scratch):
 ansible-playbook train_czech_tts.yml -K
 ```
 
-Defaults: Common Voice 17 Czech, 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.safetensors` is picked up when `voice_mode=clone`.
+Defaults: VoxPopuli Czech (`facebook/voxpopuli`, config `cs`; ~62 transcribed hours), 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.safetensors` is picked up when `voice_mode=clone`.
+
+Mozilla Common Voice is no longer hosted on Hugging Face (Mozilla Data Collective as of October 2025). To train on a CV tarball you downloaded yourself, unpack it to `metadata.csv` + `wavs/` and pass `-e f5_train_local_dir=/path/to/that/dir`.
 
 ```bash
 ansible-playbook train_czech_tts.yml -e f5_train_device=mps -e f5_train_force=true

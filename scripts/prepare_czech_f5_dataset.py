@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build an F5-TTS csv+wavs dataset from Common Voice (or a local tree)."""
+"""Build an F5-TTS csv+wavs dataset from a Hugging Face speech corpus (or a local tree).
+
+Default source is facebook/voxpopuli (Czech). Mozilla Common Voice left Hugging Face
+in October 2025; pass --local-dir if you downloaded a CV tarball yourself.
+"""
 
 from __future__ import annotations
 
@@ -23,17 +27,22 @@ import soundfile as sf  # noqa: E402
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out-dir", required=True, help="Writes wavs/ and metadata.csv")
-    p.add_argument("--hf-dataset", default="mozilla-foundation/common_voice_17_0")
+    p.add_argument("--hf-dataset", default="facebook/voxpopuli")
     p.add_argument("--hf-config", default="cs")
     p.add_argument("--hf-split", default="train")
-    p.add_argument("--text-column", default="sentence")
+    p.add_argument("--text-column", default="raw_text")
     p.add_argument("--audio-column", default="audio")
     p.add_argument("--local-dir", default="", help="Existing dataset with metadata.csv")
     p.add_argument("--max-hours", type=float, default=20.0)
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=12.0)
     p.add_argument("--sample-rate", type=int, default=24000)
-    p.add_argument("--trust-remote-code", action="store_true", default=True)
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help="Only for legacy HF loading scripts. Current datasets builds reject this.",
+    )
     return p.parse_args()
 
 
@@ -108,27 +117,98 @@ def from_local(local_dir: Path, out_dir: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+_TEXT_COLUMNS = (
+    "sentence",
+    "raw_text",
+    "normalized_text",
+    "transcription",
+    "text",
+)
+
+
+def _common_voice_removed(name: str) -> bool:
+    return "common_voice" in (name or "").lower() and "mozilla-foundation" in (name or "").lower()
+
+
+def _row_text(row: dict, preferred: str) -> str:
+    keys = [preferred, *_TEXT_COLUMNS]
+    seen: set[str] = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        val = row.get(key)
+        if val:
+            return str(val).strip()
+    return ""
+
+
+def _decode_audio(audio_obj, default_sr: int) -> tuple[np.ndarray | None, int]:
+    if audio_obj is None:
+        return None, default_sr
+    if isinstance(audio_obj, dict):
+        array = audio_obj.get("array")
+        sr = int(audio_obj.get("sampling_rate") or default_sr)
+        if array is None:
+            path = audio_obj.get("path")
+            if not path:
+                return None, default_sr
+            array, sr = sf.read(path, always_2d=False)
+        return np.asarray(array), int(sr)
+    try:
+        array = audio_obj["array"]
+        sr = int(audio_obj["sampling_rate"] or default_sr)
+        return np.asarray(array), sr
+    except Exception:
+        pass
+    getter = getattr(audio_obj, "get_all_samples", None)
+    if callable(getter):
+        samples = getter()
+        data = samples.data
+        if hasattr(data, "cpu"):
+            data = data.cpu().numpy()
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim > 1:
+            data = np.mean(data, axis=tuple(range(data.ndim - 1)))
+        sr = int(getattr(samples, "sample_rate", default_sr) or default_sr)
+        return data, sr
+    return None, default_sr
+
+
 def from_hf(args: argparse.Namespace, out_dir: Path) -> int:
     try:
         from datasets import Audio, load_dataset
     except ImportError as exc:
-        raise SystemExit("datasets is required to download Common Voice") from exc
+        raise SystemExit("datasets is required to download a Hugging Face speech corpus") from exc
+
+    if _common_voice_removed(args.hf_dataset):
+        raise SystemExit(
+            "Mozilla Common Voice is no longer on Hugging Face (moved to "
+            "Mozilla Data Collective in October 2025). Default training data is "
+            "facebook/voxpopuli config=cs. To use Common Voice, download the Czech "
+            "tarball, convert it to metadata.csv + wavs/, and pass --local-dir."
+        )
 
     apple_device.log(
         f"Loading {args.hf_dataset} config={args.hf_config} split={args.hf_split}"
     )
+    load_kwargs = {
+        "path": args.hf_dataset,
+        "name": args.hf_config or None,
+        "split": args.hf_split,
+        "streaming": True,
+    }
+    if args.trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
     try:
-        ds = load_dataset(
-            args.hf_dataset,
-            args.hf_config,
-            split=args.hf_split,
-            trust_remote_code=args.trust_remote_code,
-            streaming=True,
-        )
+        ds = load_dataset(**{k: v for k, v in load_kwargs.items() if v is not None})
+    except TypeError:
+        load_kwargs.pop("trust_remote_code", None)
+        ds = load_dataset(**{k: v for k, v in load_kwargs.items() if v is not None})
     except Exception as exc:
         raise SystemExit(
             f"Failed to load {args.hf_dataset} ({exc}). "
-            "If the repo is gated, run `huggingface-cli login` and accept the license. "
+            "If the repo is gated, run `huggingface-cli login`. "
             "Or pass --local-dir with a prepared metadata.csv."
         ) from exc
 
@@ -143,23 +223,14 @@ def from_hf(args: argparse.Namespace, out_dir: Path) -> int:
     hours = 0.0
     kept = 0
     for i, row in enumerate(ds, start=1):
-        text = str(row.get(args.text_column) or "").strip()
+        text = _row_text(row, args.text_column)
         if not text:
             continue
         if int(row.get("down_votes") or 0) > 0:
             continue
         audio_obj = row.get(args.audio_column)
-        if audio_obj is None:
-            continue
-        if isinstance(audio_obj, dict):
-            array = audio_obj.get("array")
-            sr = int(audio_obj.get("sampling_rate") or args.sample_rate)
-            if array is None:
-                path = audio_obj.get("path")
-                if not path:
-                    continue
-                array, sr = sf.read(path, always_2d=False)
-        else:
+        array, sr = _decode_audio(audio_obj, args.sample_rate)
+        if array is None:
             continue
         audio = resample_mono(array, sr, args.sample_rate)
         dur = len(audio) / float(args.sample_rate)
