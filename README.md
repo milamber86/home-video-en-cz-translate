@@ -6,9 +6,19 @@ All AI libraries run in a dedicated Python venv. Ansible itself uses system Pyth
 
 ## Prerequisites
 
-- macOS on Apple Silicon (`arm64`, not Rosetta)
-- [Homebrew](https://brew.sh/)
-- [Ansible](https://docs.ansible.com/) (`brew install ansible`)
+- macOS on Apple Silicon (`arm64`). Do not run the pipeline Python env under Rosetta.
+- [Ansible](https://docs.ansible.com/). The controller may be a Rosetta venv; modules are forced to arm64 via `scripts/ansible_python`.
+
+The **setup** role installs Apple Silicon Homebrew at `/opt/homebrew` if it is missing (Intel `/usr/local` brew can coexist and is ignored). Creating `/opt/homebrew` needs sudo once:
+
+```bash
+ansible-galaxy collection install -r requirements.yml
+ansible-playbook site.yml -K -e youtube_url='https://www.youtube.com/watch?v=VIDEO_ID'
+```
+
+`-K` prompts for the macOS administrator password. Later runs can omit `-K` once `/opt/homebrew` exists.
+
+If `ansible-playbook` fails in **Gathering Facts** with `xcrun` / `libxcrun` / `need 'x86_64'`, the controller is Rosetta and was using `/usr/bin/python3`. This repo wraps the module interpreter in `scripts/ansible_python`.
 
 Ollama is installed and started by the playbook. A Czech F5-TTS checkpoint is optional (see training below).
 
@@ -21,7 +31,7 @@ ansible-galaxy collection install -r requirements.yml
 ## Translate a video
 
 ```bash
-ansible-playbook site.yml -e youtube_url='https://www.youtube.com/watch?v=VIDEO_ID'
+ansible-playbook site.yml -K -e youtube_url='https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
 Useful extra-vars:
@@ -38,7 +48,7 @@ Tags: `setup`, `ollama`, `download`, `demucs`, `whisper_translate`, `f5_tts`, `r
 Install and start Ollama only:
 
 ```bash
-ansible-playbook site.yml --tags setup,ollama
+ansible-playbook site.yml -K --tags setup,ollama
 ```
 
 Skip environment setup on later runs:
@@ -60,7 +70,7 @@ Official F5-TTS is ZH+EN. Until you train a local checkpoint, inference uses the
 Fine-tune from `F5TTS_v1_Base` (never from scratch):
 
 ```bash
-ansible-playbook train_czech_tts.yml
+ansible-playbook train_czech_tts.yml -K
 ```
 
 Defaults: Common Voice 17 Czech, 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.safetensors` is picked up automatically by the `f5_tts` role.

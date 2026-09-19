@@ -6,12 +6,111 @@
       PyTorch MPS will likely be unavailable under Rosetta or on Intel.
   when: ansible_architecture | default(ansible_machine) != "arm64"
 
+- name: Record module interpreter architecture
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_python_interpreter }}"
+      - -c
+      - |
+        import json, platform, sys, time
+        from pathlib import Path
+        p = Path("/Users/otto/Cursor_Repos/home-video-en-cz-translate/.cursor/debug-e0bbd4.log")
+        payload = {
+            "sessionId": "e0bbd4",
+            "runId": "post-fix",
+            "hypothesisId": "D",
+            "location": "roles/setup/tasks/main.yml:module_arch",
+            "message": "Ansible module python after wrapper",
+            "data": {
+                "executable": sys.executable,
+                "platform_machine": platform.machine(),
+                "ansible_architecture": "{{ ansible_architecture | default('') }}",
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.open("a", encoding="utf-8").write(json.dumps(payload) + "\n")
+        print(platform.machine())
+  register: module_arch
+  changed_when: false
+
+- name: Stat Apple Silicon Homebrew
+  ansible.builtin.stat:
+    path: /opt/homebrew/bin/brew
+  register: as_homebrew
+
+- name: Install Apple Silicon Homebrew into /opt/homebrew
+  when:
+    - ansible_architecture | default(ansible_machine) == "arm64"
+    - not as_homebrew.stat.exists
+  block:
+    - name: Create Homebrew prefix owned by the invoking user
+      become: true
+      ansible.builtin.file:
+        path: /opt/homebrew
+        state: directory
+        owner: "{{ ansible_user_id }}"
+        group: admin
+        mode: "0755"
+
+    - name: Clone Homebrew/brew into /opt/homebrew
+      ansible.builtin.git:
+        repo: https://github.com/Homebrew/brew
+        dest: /opt/homebrew
+        version: master
+        depth: 1
+        update: false
+  rescue:
+    - name: Explain sudo is required to create /opt/homebrew
+      ansible.builtin.fail:
+        msg: >-
+          Could not install Apple Silicon Homebrew at /opt/homebrew.
+          Creating that prefix needs sudo. Re-run with -K (ask for privilege password):
+
+            ansible-playbook site.yml -K -e youtube_url='...'
+
+          Original error: {{ ansible_failed_result.msg | default(ansible_failed_result) }}
+
+- name: Re-stat Apple Silicon Homebrew after install
+  ansible.builtin.stat:
+    path: /opt/homebrew/bin/brew
+  register: as_homebrew
+
+- name: Fail if Apple Silicon Homebrew is still missing
+  ansible.builtin.fail:
+    msg: "Homebrew was not found at /opt/homebrew/bin/brew after the install attempt."
+  when:
+    - ansible_architecture | default(ansible_machine) == "arm64"
+    - not as_homebrew.stat.exists
+
+- name: Verify native brew prefix is /opt/homebrew
+  ansible.builtin.command:
+    argv:
+      - arch
+      - -arm64
+      - /opt/homebrew/bin/brew
+      - --prefix
+  register: brew_prefix_check
+  changed_when: false
+  failed_when: >-
+    brew_prefix_check.rc != 0
+    or (brew_prefix_check.stdout | trim) != '/opt/homebrew'
+  when: ansible_architecture | default(ansible_machine) == "arm64"
+
+- name: Prefer native Homebrew on PATH
+  ansible.builtin.set_fact:
+    brew_bin: "{{ '/opt/homebrew/bin' if (ansible_architecture | default(ansible_machine) == 'arm64') else '/usr/local/bin' }}"
+
 - name: Require Homebrew
   ansible.builtin.command:
-    argv: [brew, --version]
+    argv:
+      - "{{ brew_bin }}/brew"
+      - --version
   register: brew_version
   changed_when: false
   failed_when: brew_version.rc != 0
+  environment:
+    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
 
 - name: Install Homebrew packages
   community.general.homebrew:
@@ -21,12 +120,19 @@
       - uv
       - "{{ python_brew_pkg }}"
     state: present
+  environment:
+    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
 
 - name: Resolve Homebrew Python prefix
   ansible.builtin.command:
-    argv: [brew, --prefix, "{{ python_brew_pkg }}"]
+    argv:
+      - "{{ brew_bin }}/brew"
+      - --prefix
+      - "{{ python_brew_pkg }}"
   register: python_prefix
   changed_when: false
+  environment:
+    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
 
 - name: Prefer python3.11 binary
   ansible.builtin.stat:
@@ -50,17 +156,19 @@
 - name: Create project virtualenv
   ansible.builtin.command:
     argv:
-      - uv
+      - "{{ brew_bin }}/uv"
       - venv
       - "{{ venv_path }}"
       - --python
       - "{{ brew_python }}"
     creates: "{{ venv_python }}"
+  environment:
+    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
 
 - name: Install Python dependencies into venv
   ansible.builtin.command:
     argv:
-      - uv
+      - "{{ brew_bin }}/uv"
       - pip
       - install
       - --python
@@ -69,13 +177,19 @@
       - "{{ playbook_dir }}/requirements.txt"
   register: uv_pip
   changed_when: "'Installed' in (uv_pip.stdout | default('')) or 'Uninstalled' in (uv_pip.stdout | default(''))"
+  environment:
+    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
 
 - name: Verify ffmpeg
   ansible.builtin.command:
-    argv: [ffmpeg, -version]
+    argv:
+      - "{{ brew_bin }}/ffmpeg"
+      - -version
   register: ffmpeg_version
   changed_when: false
   failed_when: ffmpeg_version.rc != 0
+  environment:
+    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
 
 - name: Verify PyTorch MPS on Apple Silicon
   ansible.builtin.command:

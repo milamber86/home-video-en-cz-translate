@@ -1,0 +1,10 @@
+#!/bin/bash
+# Force native Apple Silicon Python for Ansible modules.
+# A Rosetta (x86_64) Ansible controller otherwise inherits the x86_64 slice of
+# /usr/bin/python3, which crashes in xcrun/libxcrun (arm64-only CLT).
+# region agent log
+_LOG="/Users/otto/Cursor_Repos/home-video-en-cz-translate/.cursor/debug-e0bbd4.log"
+_TS="$(($(date +%s) * 1000))"
+printf '%s\n' "{\"sessionId\":\"e0bbd4\",\"runId\":\"post-fix\",\"hypothesisId\":\"A\",\"location\":\"scripts/ansible_python\",\"message\":\"arm64 wrapper exec\",\"data\":{\"wrapper_uname\":\"$(uname -m)\",\"arg0\":\"${1:-}\"},\"timestamp\":${_TS}}" >> "${_LOG}" 2>/dev/null || true
+# endregion
+exec arch -arm64 /usr/bin/python3 "$@"

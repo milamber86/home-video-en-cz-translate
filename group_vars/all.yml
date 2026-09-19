@@ -1,4 +1,7 @@
 ---
+# Ansible modules must run as arm64 even if the controller venv is Rosetta.
+ansible_python_interpreter: "{{ playbook_dir }}/scripts/ansible_python"
+
 # Shared paths
 work_root: "{{ playbook_dir }}/work"
 venv_path: "{{ playbook_dir }}/.venv"
