@@ -145,40 +145,58 @@
 
 - name: Prefer native Homebrew on PATH
   ansible.builtin.set_fact:
-    brew_bin: "{{ '/opt/homebrew/bin' if (ansible_architecture | default(ansible_machine) == 'arm64') else '/usr/local/bin' }}"
+    brew_bin: "{{ homebrew_prefix }}/bin"
+  when: ansible_architecture | default(ansible_machine) == "arm64"
 
 - name: Require Homebrew
   ansible.builtin.command:
     argv:
+      - arch
+      - -arm64
       - "{{ brew_bin }}/brew"
       - --version
   register: brew_version
   changed_when: false
   failed_when: brew_version.rc != 0
-  environment:
-    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
+  environment: "{{ brew_env }}"
+
+- name: Fail if brew is running as Intel/Rosetta
+  ansible.builtin.fail:
+    msg: >-
+      Native brew at {{ brew_bin }}/brew reported an Intel/Rosetta environment.
+      Package installs must use arch -arm64. Output: {{ brew_version.stdout }} {{ brew_version.stderr }}
+  when: "'Intel x86_64' in (brew_version.stderr | default('')) or 'Intel x86_64' in (brew_version.stdout | default(''))"
 
 - name: Install Homebrew packages
-  community.general.homebrew:
-    name:
+  ansible.builtin.command:
+    argv:
+      - arch
+      - -arm64
+      - "{{ brew_bin }}/brew"
+      - install
       - git
       - ffmpeg
       - uv
       - "{{ python_brew_pkg }}"
-    state: present
-  environment:
-    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
+  register: brew_install
+  environment: "{{ brew_env }}"
+  changed_when: >-
+    'Pouring' in (brew_install.stdout | default(''))
+    or 'Fetching downloads' in (brew_install.stdout | default(''))
+    or '==> Installing' in (brew_install.stdout | default(''))
+  failed_when: brew_install.rc != 0
 
 - name: Resolve Homebrew Python prefix
   ansible.builtin.command:
     argv:
+      - arch
+      - -arm64
       - "{{ brew_bin }}/brew"
       - --prefix
       - "{{ python_brew_pkg }}"
   register: python_prefix
   changed_when: false
-  environment:
-    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
+  environment: "{{ brew_env }}"
 
 - name: Prefer python3.11 binary
   ansible.builtin.stat:
@@ -208,8 +226,7 @@
       - --python
       - "{{ brew_python }}"
     creates: "{{ venv_python }}"
-  environment:
-    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
+  environment: "{{ brew_env }}"
 
 - name: Install Python dependencies into venv
   ansible.builtin.command:
@@ -223,8 +240,7 @@
       - "{{ playbook_dir }}/requirements.txt"
   register: uv_pip
   changed_when: "'Installed' in (uv_pip.stdout | default('')) or 'Uninstalled' in (uv_pip.stdout | default(''))"
-  environment:
-    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
+  environment: "{{ brew_env }}"
 
 - name: Verify ffmpeg
   ansible.builtin.command:
@@ -234,8 +250,7 @@
   register: ffmpeg_version
   changed_when: false
   failed_when: ffmpeg_version.rc != 0
-  environment:
-    PATH: "{{ brew_bin }}:{{ ansible_env.PATH }}"
+  environment: "{{ brew_env }}"
 
 - name: Verify PyTorch MPS on Apple Silicon
   ansible.builtin.command:

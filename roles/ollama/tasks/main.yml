@@ -1,22 +1,32 @@
 ---
-- name: Install Ollama via Homebrew
-  community.general.homebrew:
-    name: ollama
-    state: present
-
-- name: Start Ollama Homebrew service (localhost LaunchAgent)
-  community.general.homebrew_services:
-    name: ollama
-    state: started
-  register: ollama_service
-  ignore_errors: true
-
-- name: Start Ollama via brew services fallback
+- name: Install Ollama via native Homebrew
   ansible.builtin.command:
-    argv: [brew, services, start, ollama]
-  when: ollama_service is failed
-  register: ollama_service_fallback
-  changed_when: ollama_service_fallback.rc == 0
+    argv:
+      - arch
+      - -arm64
+      - "{{ brew_bin }}/brew"
+      - install
+      - ollama
+  register: ollama_brew
+  environment: "{{ brew_env }}"
+  changed_when: >-
+    'Pouring' in (ollama_brew.stdout | default(''))
+    or 'Fetching downloads' in (ollama_brew.stdout | default(''))
+    or '==> Installing' in (ollama_brew.stdout | default(''))
+  failed_when: ollama_brew.rc != 0
+
+- name: Start Ollama Homebrew service
+  ansible.builtin.command:
+    argv:
+      - arch
+      - -arm64
+      - "{{ brew_bin }}/brew"
+      - services
+      - start
+      - ollama
+  register: ollama_service
+  environment: "{{ brew_env }}"
+  changed_when: "'Successfully started' in (ollama_service.stdout | default(''))"
 
 - name: Wait for Ollama API on localhost
   ansible.builtin.uri:
@@ -32,23 +42,31 @@
   ansible.builtin.fail:
     msg: >-
       Ollama did not respond at {{ ollama_url }}/api/tags.
-      Check `brew services list` and `brew services restart ollama`.
+      Check `{{ brew_bin }}/brew services list` and
+      `arch -arm64 {{ brew_bin }}/brew services restart ollama`.
       The service is bound to localhost only ({{ ollama_bind }}).
   when: ollama_ready.status | default(0) != 200
 
 - name: List installed Ollama models
   ansible.builtin.command:
-    argv: [ollama, list]
+    argv:
+      - "{{ brew_bin }}/ollama"
+      - list
   register: ollama_list
   changed_when: false
   environment:
     OLLAMA_HOST: "{{ ollama_bind }}"
+    PATH: "{{ brew_env.PATH }}"
 
 - name: Pull Ollama translation model
   ansible.builtin.command:
-    argv: [ollama, pull, "{{ ollama_model }}"]
+    argv:
+      - "{{ brew_bin }}/ollama"
+      - pull
+      - "{{ ollama_model }}"
   environment:
     OLLAMA_HOST: "{{ ollama_bind }}"
+    PATH: "{{ brew_env.PATH }}"
   async: 3600
   poll: 15
   register: ollama_pull

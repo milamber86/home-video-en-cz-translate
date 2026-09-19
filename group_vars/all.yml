@@ -12,6 +12,20 @@ scripts_dir: "{{ playbook_dir }}/scripts"
 vendor_dir: "{{ playbook_dir }}/vendor"
 f5_repo_dir: "{{ vendor_dir }}/F5-TTS"
 
+# Native Apple Silicon Homebrew only. Never search /usr/local (Rosetta brew).
+homebrew_prefix: /opt/homebrew
+brew_bin: "{{ homebrew_prefix }}/bin"
+brew_env:
+  PATH: "{{ brew_bin }}:/usr/bin:/bin:/usr/sbin:/sbin"
+  HOMEBREW_PREFIX: "{{ homebrew_prefix }}"
+  HOMEBREW_REPOSITORY: "{{ homebrew_prefix }}"
+  HOMEBREW_CELLAR: "{{ homebrew_prefix }}/Cellar"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_COLOR: "1"
+
+
 # ASR
 whisper_backend: mlx
 whisper_model: mlx-community/whisper-large-v3-mlx
@@ -64,7 +78,7 @@ bed_gain: 0.85
 # yt-dlp
 ytdlp_cookies_from_browser: ""
 
-# Demucs
+# Demucs (htdemucs transformer max trained segment is 7.8s)
 demucs_model: htdemucs
-demucs_segment: 10
+demucs_segment: 7.8
 demucs_overlap: 0.25
