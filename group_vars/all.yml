@@ -78,7 +78,7 @@ bed_gain: 0.85
 # yt-dlp
 ytdlp_cookies_from_browser: ""
 
-# Demucs (htdemucs transformer max trained segment is 7.8s)
+# Demucs CLI --segment is an int; htdemucs transformer max is 7.8s
 demucs_model: htdemucs
-demucs_segment: 7.8
+demucs_segment: 7
 demucs_overlap: 0.25
