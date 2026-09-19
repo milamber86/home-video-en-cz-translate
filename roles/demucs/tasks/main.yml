@@ -1,0 +1,123 @@
+---
+- name: Load last job facts
+  ansible.builtin.include_vars: "{{ work_root }}/current_job.yml"
+  when: video_id is not defined
+
+- name: Check existing Demucs stems
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ job_dir }}/audio/vocals.wav"
+    - "{{ job_dir }}/audio/no_vocals.wav"
+  register: stem_stats
+
+- name: Set skip_demucs fact
+  ansible.builtin.set_fact:
+    skip_demucs: "{{ stem_stats.results | map(attribute='stat.exists') | min }}"
+
+- name: Separate vocals on MPS
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - -m
+      - demucs
+      - -n
+      - "{{ demucs_model }}"
+      - --two-stems=vocals
+      - -d
+      - mps
+      - --segment
+      - "{{ demucs_segment | string }}"
+      - --overlap
+      - "{{ demucs_overlap | string }}"
+      - -o
+      - "{{ job_dir }}/audio/separated"
+      - --filename
+      - "{track}/{stem}.{ext}"
+      - "{{ job_dir }}/audio/source.wav"
+  environment: "{{ pytorch_env }}"
+  register: demucs_mps
+  when: not (skip_demucs | bool)
+  ignore_errors: true
+
+- name: Separate vocals on CPU fallback
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - -m
+      - demucs
+      - -n
+      - "{{ demucs_model }}"
+      - --two-stems=vocals
+      - -d
+      - cpu
+      - --segment
+      - "{{ demucs_segment | string }}"
+      - --overlap
+      - "{{ demucs_overlap | string }}"
+      - -o
+      - "{{ job_dir }}/audio/separated"
+      - --filename
+      - "{track}/{stem}.{ext}"
+      - "{{ job_dir }}/audio/source.wav"
+  environment: "{{ pytorch_env }}"
+  register: demucs_cpu
+  when: not (skip_demucs | bool) and demucs_mps is failed
+  failed_when: demucs_cpu.rc != 0
+
+- name: Fail if Demucs did not run successfully
+  ansible.builtin.fail:
+    msg: |
+      Demucs failed on MPS and CPU.
+      MPS: {{ demucs_mps.stderr | default('') }}
+      CPU: {{ demucs_cpu.stderr | default('') }}
+  when:
+    - not (skip_demucs | bool)
+    - demucs_mps is failed
+    - demucs_cpu is skipped or demucs_cpu is failed
+
+- name: Locate Demucs stem files
+  ansible.builtin.find:
+    paths: "{{ job_dir }}/audio/separated"
+    patterns:
+      - vocals.wav
+      - no_vocals.wav
+    recurse: true
+  register: demucs_stems
+  when: not (skip_demucs | bool)
+
+- name: Copy vocals stem
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "{{ job_dir }}/audio/vocals.wav"
+    remote_src: true
+    mode: "0644"
+  loop: "{{ demucs_stems.files | default([]) }}"
+  when:
+    - not (skip_demucs | bool)
+    - item.path | basename == 'vocals.wav'
+
+- name: Copy accompaniment stem
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "{{ job_dir }}/audio/no_vocals.wav"
+    remote_src: true
+    mode: "0644"
+  loop: "{{ demucs_stems.files | default([]) }}"
+  when:
+    - not (skip_demucs | bool)
+    - item.path | basename == 'no_vocals.wav'
+
+- name: Verify stems exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ job_dir }}/audio/vocals.wav"
+    - "{{ job_dir }}/audio/no_vocals.wav"
+  register: final_stems
+
+- name: Fail if stems are missing
+  ansible.builtin.fail:
+    msg: "Missing Demucs stem {{ item.item }}"
+  loop: "{{ final_stems.results }}"
+  when: not item.stat.exists

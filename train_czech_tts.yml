@@ -1,0 +1,10 @@
+---
+- name: Fine-tune Czech F5-TTS checkpoint
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  roles:
+    - role: setup
+      tags: [setup]
+    - role: train_f5_czech
+      tags: [train_f5_czech, train]

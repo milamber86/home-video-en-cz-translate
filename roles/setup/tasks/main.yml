@@ -1,0 +1,96 @@
+---
+- name: Warn if this host is not Apple Silicon arm64
+  ansible.builtin.debug:
+    msg: >-
+      Expected Apple Silicon arm64; ansible_machine={{ ansible_architecture | default(ansible_machine) }}.
+      PyTorch MPS will likely be unavailable under Rosetta or on Intel.
+  when: ansible_architecture | default(ansible_machine) != "arm64"
+
+- name: Require Homebrew
+  ansible.builtin.command:
+    argv: [brew, --version]
+  register: brew_version
+  changed_when: false
+  failed_when: brew_version.rc != 0
+
+- name: Install Homebrew packages
+  community.general.homebrew:
+    name:
+      - git
+      - ffmpeg
+      - uv
+      - "{{ python_brew_pkg }}"
+    state: present
+
+- name: Resolve Homebrew Python prefix
+  ansible.builtin.command:
+    argv: [brew, --prefix, "{{ python_brew_pkg }}"]
+  register: python_prefix
+  changed_when: false
+
+- name: Prefer python3.11 binary
+  ansible.builtin.stat:
+    path: "{{ python_prefix.stdout | trim }}/bin/python3.11"
+  register: python311_bin
+
+- name: Fall back to python3 binary
+  ansible.builtin.stat:
+    path: "{{ python_prefix.stdout | trim }}/bin/python3"
+  register: python3_bin
+
+- name: Fail if Homebrew Python is missing
+  ansible.builtin.fail:
+    msg: "Python not found under {{ python_prefix.stdout | trim }}/bin. Check {{ python_brew_pkg }} is installed."
+  when: not python311_bin.stat.exists and not python3_bin.stat.exists
+
+- name: Set Python interpreter fact
+  ansible.builtin.set_fact:
+    brew_python: "{{ python311_bin.stat.path if python311_bin.stat.exists else python3_bin.stat.path }}"
+
+- name: Create project virtualenv
+  ansible.builtin.command:
+    argv:
+      - uv
+      - venv
+      - "{{ venv_path }}"
+      - --python
+      - "{{ brew_python }}"
+    creates: "{{ venv_python }}"
+
+- name: Install Python dependencies into venv
+  ansible.builtin.command:
+    argv:
+      - uv
+      - pip
+      - install
+      - --python
+      - "{{ venv_python }}"
+      - -r
+      - "{{ playbook_dir }}/requirements.txt"
+  register: uv_pip
+  changed_when: "'Installed' in (uv_pip.stdout | default('')) or 'Uninstalled' in (uv_pip.stdout | default(''))"
+
+- name: Verify ffmpeg
+  ansible.builtin.command:
+    argv: [ffmpeg, -version]
+  register: ffmpeg_version
+  changed_when: false
+  failed_when: ffmpeg_version.rc != 0
+
+- name: Verify PyTorch MPS on Apple Silicon
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - -c
+      - |
+        import os
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        import torch
+        ok = torch.backends.mps.is_available() and torch.backends.mps.is_built()
+        print("mps_available=" + str(ok))
+        raise SystemExit(0 if ok else 1)
+  environment: "{{ pytorch_env }}"
+  register: mps_check
+  changed_when: false
+  failed_when: mps_check.rc != 0
+  when: ansible_architecture | default(ansible_machine) == "arm64"

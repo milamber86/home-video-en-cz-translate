@@ -1,0 +1,20 @@
+# Apple Silicon (arm64) wheels; torch includes MPS.
+torch>=2.5.0
+torchaudio>=2.5.0
+yt-dlp[default]>=2025.1.0
+demucs>=4.0.0
+mlx-whisper>=0.4.0
+transformers>=4.44.0
+sentencepiece>=0.2.0
+sacremoses>=0.1.0
+srt>=3.5.0
+f5-tts>=1.0.0
+soundfile>=0.12.1
+numpy>=1.26.0
+httpx>=0.27.0
+datasets>=3.0.0
+huggingface_hub>=0.25.0
+safetensors>=0.4.0
+accelerate>=0.34.0
+librosa>=0.10.0
+pydub>=0.25.1

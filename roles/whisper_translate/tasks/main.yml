@@ -1,0 +1,91 @@
+---
+- name: Load last job facts
+  ansible.builtin.include_vars: "{{ work_root }}/current_job.yml"
+  when: video_id is not defined
+
+- name: Check existing Czech subtitles
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/subs/cs.srt"
+  register: cs_srt
+
+- name: Find downloaded English SRT
+  ansible.builtin.find:
+    paths: "{{ job_dir }}/raw"
+    patterns:
+      - "{{ video_id }}.en.srt"
+      - "{{ video_id }}.en-*.srt"
+      - "{{ video_id }}.en*.srt"
+  register: en_subs
+  when: not cs_srt.stat.exists
+
+- name: Translate using downloaded English SRT
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - "{{ scripts_dir }}/whisper_translate.py"
+      - --audio
+      - "{{ job_dir }}/audio/vocals.wav"
+      - --en-srt
+      - "{{ (en_subs.files | sort(attribute='path') | first).path }}"
+      - --out-en
+      - "{{ job_dir }}/subs/en.srt"
+      - --out-cs
+      - "{{ job_dir }}/subs/cs.srt"
+      - --whisper-model
+      - "{{ whisper_model }}"
+      - --device
+      - mps
+      - --translation-backend
+      - "{{ translation_backend }}"
+      - --ollama-url
+      - "{{ ollama_url }}"
+      - --ollama-model
+      - "{{ ollama_model }}"
+      - --marian-model
+      - "{{ marian_model }}"
+  environment: "{{ pytorch_env }}"
+  register: whisper_with_srt
+  failed_when: whisper_with_srt.rc != 0
+  when:
+    - not cs_srt.stat.exists
+    - (en_subs.files | default([]) | length) > 0
+
+- name: Transcribe vocals and translate to Czech
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - "{{ scripts_dir }}/whisper_translate.py"
+      - --audio
+      - "{{ job_dir }}/audio/vocals.wav"
+      - --out-en
+      - "{{ job_dir }}/subs/en.srt"
+      - --out-cs
+      - "{{ job_dir }}/subs/cs.srt"
+      - --whisper-model
+      - "{{ whisper_model }}"
+      - --device
+      - mps
+      - --translation-backend
+      - "{{ translation_backend }}"
+      - --ollama-url
+      - "{{ ollama_url }}"
+      - --ollama-model
+      - "{{ ollama_model }}"
+      - --marian-model
+      - "{{ marian_model }}"
+  environment: "{{ pytorch_env }}"
+  register: whisper_from_audio
+  failed_when: whisper_from_audio.rc != 0
+  when:
+    - not cs_srt.stat.exists
+    - (en_subs.files | default([]) | length) == 0
+
+- name: Verify Czech SRT
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/subs/cs.srt"
+  register: cs_srt_after
+
+- name: Fail if Czech SRT is missing
+  ansible.builtin.fail:
+    msg: "whisper_translate.py did not write {{ job_dir }}/subs/cs.srt"
+  when: not cs_srt_after.stat.exists

@@ -1,0 +1,262 @@
+---
+- name: Stat existing Czech F5 checkpoint
+  ansible.builtin.stat:
+    path: "{{ f5_ckpt_dir }}/model_last.safetensors"
+  register: existing_st
+
+- name: Stat existing Czech F5 pt checkpoint
+  ansible.builtin.stat:
+    path: "{{ f5_ckpt_dir }}/model_last.pt"
+  register: existing_pt
+
+- name: Decide whether to train
+  ansible.builtin.set_fact:
+    f5_do_train: "{{ (f5_train_force | bool) or (not existing_st.stat.exists and not existing_pt.stat.exists) }}"
+
+- name: Skip training when a checkpoint already exists
+  ansible.builtin.debug:
+    msg: >-
+      Using existing checkpoint in {{ f5_ckpt_dir }}.
+      Re-run with -e f5_train_force=true to train again.
+  when: not (f5_do_train | bool)
+
+- name: Fine-tune Czech F5-TTS
+  when: f5_do_train | bool
+  block:
+    - name: Create training directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ vendor_dir }}"
+        - "{{ f5_data_dir }}/raw"
+        - "{{ f5_data_dir }}/prepared"
+        - "{{ f5_ckpt_dir }}"
+
+    - name: Clone F5-TTS for editable fine-tune install
+      ansible.builtin.git:
+        repo: https://github.com/SWivid/F5-TTS.git
+        dest: "{{ f5_repo_dir }}"
+        version: main
+        depth: 1
+        update: false
+
+    - name: Editable-install F5-TTS (Vocos only, no BigVGAN)
+      ansible.builtin.command:
+        argv:
+          - uv
+          - pip
+          - install
+          - --python
+          - "{{ venv_python }}"
+          - -e
+          - "{{ f5_repo_dir }}"
+      register: f5_editable
+      changed_when: "'Installed' in (f5_editable.stdout | default('')) or 'Uninstalled' in (f5_editable.stdout | default(''))"
+
+    - name: Check prepared dataset metadata
+      ansible.builtin.stat:
+        path: "{{ f5_data_dir }}/raw/metadata.csv"
+      register: raw_meta
+
+    - name: Download and prepare Czech speech clips
+      ansible.builtin.command:
+        argv: "{{ prepare_base + prepare_local }}"
+      vars:
+        prepare_base:
+          - "{{ venv_python }}"
+          - "{{ scripts_dir }}/prepare_czech_f5_dataset.py"
+          - --out-dir
+          - "{{ f5_data_dir }}/raw"
+          - --hf-dataset
+          - "{{ f5_train_dataset }}"
+          - --hf-config
+          - "{{ f5_train_dataset_config }}"
+          - --hf-split
+          - "{{ f5_train_dataset_split }}"
+          - --text-column
+          - "{{ f5_train_text_column }}"
+          - --audio-column
+          - "{{ f5_train_audio_column }}"
+          - --max-hours
+          - "{{ f5_train_max_hours | string }}"
+          - --min-seconds
+          - "{{ f5_train_min_seconds | string }}"
+          - --max-seconds
+          - "{{ f5_train_max_seconds | string }}"
+        prepare_local: "{{ ['--local-dir', f5_train_local_dir] if f5_train_local_dir | length > 0 else [] }}"
+      environment: "{{ pytorch_env }}"
+      register: prepare_data
+      failed_when: prepare_data.rc != 0
+      when: not raw_meta.stat.exists or (f5_train_force | bool)
+
+    - name: Extend F5 vocab and text embeddings for Czech
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - "{{ scripts_dir }}/extend_f5_vocab.py"
+          - --metadata-csv
+          - "{{ f5_data_dir }}/raw/metadata.csv"
+          - --out-vocab
+          - "{{ f5_data_dir }}/extended_vocab.txt"
+          - --out-ckpt
+          - "{{ f5_data_dir }}/pretrained_extended.safetensors"
+          - --model
+          - "{{ f5_model }}"
+      environment: "{{ pytorch_env }}"
+      register: extend_vocab
+      failed_when: extend_vocab.rc != 0
+
+    - name: Build F5-TTS arrow dataset (fine-tune vocab copy)
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - "{{ f5_repo_dir }}/src/f5_tts/train/datasets/prepare_csv_wavs.py"
+          - "{{ f5_data_dir }}/raw/metadata.csv"
+          - "{{ f5_data_dir }}/prepared"
+      environment: "{{ pytorch_env }}"
+      register: prepare_arrow
+      failed_when: prepare_arrow.rc != 0
+
+    - name: Install extended vocab into prepared dataset
+      ansible.builtin.copy:
+        src: "{{ f5_data_dir }}/extended_vocab.txt"
+        dest: "{{ f5_data_dir }}/prepared/vocab.txt"
+        remote_src: true
+        mode: "0644"
+
+    - name: Create F5-TTS custom dataset directory
+      ansible.builtin.file:
+        path: "{{ f5_repo_dir }}/data/{{ f5_train_dataset_name }}_custom"
+        state: directory
+        mode: "0755"
+
+    - name: Copy prepared dataset into F5-TTS data path
+      ansible.builtin.command:
+        argv:
+          - cp
+          - -a
+          - "{{ f5_data_dir }}/prepared/."
+          - "{{ f5_repo_dir }}/data/{{ f5_train_dataset_name }}_custom/"
+
+    - name: Fine-tune F5TTS_v1_Base on Czech
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - -m
+          - f5_tts.train.finetune_cli
+          - --exp_name
+          - F5TTS_v1_Base
+          - --dataset_name
+          - "{{ f5_train_dataset_name }}"
+          - --finetune
+          - --pretrain
+          - "{{ f5_data_dir }}/pretrained_extended.safetensors"
+          - --tokenizer
+          - custom
+          - --tokenizer_path
+          - "{{ f5_repo_dir }}/data/{{ f5_train_dataset_name }}_custom/vocab.txt"
+          - --learning_rate
+          - "{{ f5_train_lr | string }}"
+          - --batch_size_per_gpu
+          - "{{ f5_train_batch_frames | string }}"
+          - --batch_size_type
+          - frame
+          - --max_samples
+          - "32"
+          - --grad_accumulation_steps
+          - "{{ f5_train_grad_accum | string }}"
+          - --epochs
+          - "{{ f5_train_epochs | string }}"
+          - --num_warmup_updates
+          - "500"
+          - --save_per_updates
+          - "1000"
+          - --last_per_updates
+          - "500"
+          - --log_samples
+      environment: "{{ pytorch_env | combine({'WANDB_MODE': 'disabled', 'ACCELERATE_USE_CPU': 'true' if f5_train_device == 'cpu' else 'false'}) }}"
+      register: f5_train
+      failed_when: f5_train.rc != 0
+      async: 86400
+      poll: 30
+
+    - name: Find trained checkpoints
+      ansible.builtin.find:
+        paths: "{{ f5_repo_dir }}/ckpts/{{ f5_train_dataset_name }}"
+        patterns:
+          - "model_*.pt"
+          - "model_*.safetensors"
+          - "*last*"
+        recurse: false
+      register: trained_ckpts
+
+    - name: Fail if training produced no checkpoint
+      ansible.builtin.fail:
+        msg: >-
+          Fine-tune finished but no checkpoint was found under
+          {{ f5_repo_dir }}/ckpts/{{ f5_train_dataset_name }}
+      when: (trained_ckpts.files | rejectattr('path', 'search', 'pretrained_') | list | length) == 0
+
+    - name: Select latest non-pretrained checkpoint
+      ansible.builtin.set_fact:
+        latest_f5_ckpt: "{{ (trained_ckpts.files | rejectattr('path', 'search', 'pretrained_') | list | sort(attribute='mtime') | last).path }}"
+
+    - name: Install checkpoint into models/f5_czech
+      ansible.builtin.copy:
+        src: "{{ latest_f5_ckpt }}"
+        dest: "{{ f5_ckpt_dir }}/model_last{{ latest_f5_ckpt | regex_search('\\.[^.]+$') }}"
+        remote_src: true
+        mode: "0644"
+
+    - name: Install extended vocab next to the checkpoint
+      ansible.builtin.copy:
+        src: "{{ f5_data_dir }}/extended_vocab.txt"
+        dest: "{{ f5_ckpt_dir }}/vocab.txt"
+        remote_src: true
+        mode: "0644"
+
+    - name: Read first training clip for smoke test
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - -c
+          - |
+            import csv, pathlib, json
+            p = pathlib.Path(r"{{ f5_data_dir }}/raw/metadata.csv")
+            with p.open(encoding="utf-8-sig", newline="") as fh:
+                reader = csv.reader(fh, delimiter="|")
+                next(reader, None)
+                row = next(reader)
+            print(json.dumps({"audio": row[0], "text": row[1]}))
+      register: smoke_ref
+      changed_when: false
+
+    - name: Smoke-test Czech F5 inference
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - "{{ scripts_dir }}/synthesize_czech.py"
+          - --smoke-test
+          - --out
+          - "{{ f5_data_dir }}/smoke.wav"
+          - --device
+          - "{{ 'mps' if f5_train_device == 'mps' else 'cpu' }}"
+          - --voice-mode
+          - bundled
+          - --ref-audio
+          - "{{ (smoke_ref.stdout | from_json).audio }}"
+          - --ref-text
+          - "{{ (smoke_ref.stdout | from_json).text }}"
+          - --ckpt
+          - "{{ f5_ckpt_dir }}/model_last{{ latest_f5_ckpt | regex_search('\\.[^.]+$') }}"
+          - --vocab
+          - "{{ f5_ckpt_dir }}/vocab.txt"
+          - --f5-model
+          - "{{ f5_model }}"
+          - --smoke-text
+          - "{{ f5_train_smoke_text }}"
+      environment: "{{ pytorch_env }}"
+      register: smoke
+      failed_when: smoke.rc != 0

@@ -1,0 +1,146 @@
+---
+- name: Require youtube_url
+  ansible.builtin.assert:
+    that:
+      - youtube_url is defined
+      - youtube_url | length > 0
+    fail_msg: "Pass -e youtube_url='https://www.youtube.com/watch?v=...'"
+
+- name: Resolve YouTube video ID
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - -m
+      - yt_dlp
+      - --print
+      - id
+      - --skip-download
+      - --no-warnings
+      - "{{ youtube_url }}"
+  register: ytdlp_id
+  changed_when: false
+
+- name: Set job facts
+  ansible.builtin.set_fact:
+    video_id: "{{ ytdlp_id.stdout | trim }}"
+    job_dir: "{{ work_root }}/{{ ytdlp_id.stdout | trim }}"
+
+- name: Create job directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ work_root }}"
+    - "{{ job_dir }}"
+    - "{{ job_dir }}/raw"
+    - "{{ job_dir }}/audio"
+    - "{{ job_dir }}/subs"
+    - "{{ job_dir }}/tts"
+    - "{{ job_dir }}/tts/segments"
+    - "{{ job_dir }}/output"
+
+- name: Check for existing video
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/raw/{{ video_id }}.mp4"
+  register: video_stat
+
+- name: Download video and English subtitles
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - -m
+      - yt_dlp
+      - --format
+      - bv*+ba/b
+      - --merge-output-format
+      - mp4
+      - --write-subs
+      - --write-auto-subs
+      - --sub-langs
+      - en.*
+      - --convert-subs
+      - srt
+      - --restrict-filenames
+      - --no-overwrites
+      - --output
+      - "{{ job_dir }}/raw/%(id)s.%(ext)s"
+      - "{{ youtube_url }}"
+  register: ytdlp_download
+  failed_when: ytdlp_download.rc != 0
+  when:
+    - not video_stat.stat.exists
+    - ytdlp_cookies_from_browser | length == 0
+
+- name: Download video and English subtitles (browser cookies)
+  ansible.builtin.command:
+    argv:
+      - "{{ venv_python }}"
+      - -m
+      - yt_dlp
+      - --format
+      - bv*+ba/b
+      - --merge-output-format
+      - mp4
+      - --write-subs
+      - --write-auto-subs
+      - --sub-langs
+      - en.*
+      - --convert-subs
+      - srt
+      - --restrict-filenames
+      - --no-overwrites
+      - --output
+      - "{{ job_dir }}/raw/%(id)s.%(ext)s"
+      - --cookies-from-browser
+      - "{{ ytdlp_cookies_from_browser }}"
+      - "{{ youtube_url }}"
+  register: ytdlp_download_cookies
+  failed_when: ytdlp_download_cookies.rc != 0
+  when:
+    - not video_stat.stat.exists
+    - ytdlp_cookies_from_browser | length > 0
+
+- name: Recheck downloaded video
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/raw/{{ video_id }}.mp4"
+  register: video_stat_after
+
+- name: Fail if video file is missing
+  ansible.builtin.fail:
+    msg: "yt-dlp did not produce {{ job_dir }}/raw/{{ video_id }}.mp4"
+  when: not video_stat_after.stat.exists
+
+- name: Check for extracted source WAV
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/audio/source.wav"
+  register: source_wav_stat
+
+- name: Extract stereo PCM audio
+  ansible.builtin.command:
+    argv:
+      - ffmpeg
+      - -y
+      - -i
+      - "{{ job_dir }}/raw/{{ video_id }}.mp4"
+      - -vn
+      - -acodec
+      - pcm_s16le
+      - -ar
+      - "44100"
+      - -ac
+      - "2"
+      - "{{ job_dir }}/audio/source.wav"
+  register: extract_audio
+  failed_when: extract_audio.rc != 0
+  when: not source_wav_stat.stat.exists
+
+- name: Persist job facts for later tags
+  ansible.builtin.copy:
+    dest: "{{ work_root }}/current_job.yml"
+    mode: "0644"
+    content: |
+      video_id: "{{ video_id }}"
+      job_dir: "{{ job_dir }}"
+      video_path: "{{ job_dir }}/raw/{{ video_id }}.mp4"
+      source_wav: "{{ job_dir }}/audio/source.wav"

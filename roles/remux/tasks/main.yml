@@ -1,0 +1,141 @@
+---
+- name: Load last job facts
+  ansible.builtin.include_vars: "{{ work_root }}/current_job.yml"
+  when: video_id is not defined
+
+- name: Set remux output path
+  ansible.builtin.set_fact:
+    remux_output: "{{ job_dir }}/output/{{ video_id }}.cs.{{ output_container }}"
+
+- name: Check existing remux output
+  ansible.builtin.stat:
+    path: "{{ remux_output }}"
+  register: remux_stat
+
+- name: Mix Czech vocals with original accompaniment
+  ansible.builtin.command:
+    argv:
+      - ffmpeg
+      - -y
+      - -i
+      - "{{ job_dir }}/tts/czech_vocals.wav"
+      - -i
+      - "{{ job_dir }}/audio/no_vocals.wav"
+      - -filter_complex
+      - >-
+        [0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume={{ vocals_gain }}[v];
+        [1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume={{ bed_gain }}[b];
+        [v][b]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]
+      - -map
+      - "[a]"
+      - -c:a
+      - pcm_s16le
+      - "{{ job_dir }}/audio/mixed.wav"
+  register: mix_audio
+  failed_when: mix_audio.rc != 0
+  when: not remux_stat.stat.exists
+
+- name: Remux video, mixed audio, and Czech subtitles (MKV)
+  ansible.builtin.command:
+    argv:
+      - ffmpeg
+      - -y
+      - -i
+      - "{{ job_dir }}/raw/{{ video_id }}.mp4"
+      - -i
+      - "{{ job_dir }}/audio/mixed.wav"
+      - -i
+      - "{{ job_dir }}/subs/cs.srt"
+      - -map
+      - "0:v:0"
+      - -map
+      - "1:a:0"
+      - -map
+      - "2:s:0"
+      - -c:v
+      - copy
+      - -c:a
+      - aac
+      - -b:a
+      - 192k
+      - -c:s
+      - srt
+      - -metadata:s:a:0
+      - language=ces
+      - -metadata:s:s:0
+      - language=ces
+      - -shortest
+      - "{{ remux_output }}"
+  register: remux_mkv
+  failed_when: remux_mkv.rc != 0
+  when:
+    - not remux_stat.stat.exists
+    - output_container == 'mkv'
+
+- name: Remux video, mixed audio, and Czech subtitles (MP4)
+  ansible.builtin.command:
+    argv:
+      - ffmpeg
+      - -y
+      - -i
+      - "{{ job_dir }}/raw/{{ video_id }}.mp4"
+      - -i
+      - "{{ job_dir }}/audio/mixed.wav"
+      - -i
+      - "{{ job_dir }}/subs/cs.srt"
+      - -map
+      - "0:v:0"
+      - -map
+      - "1:a:0"
+      - -map
+      - "2:s:0"
+      - -c:v
+      - copy
+      - -c:a
+      - aac
+      - -b:a
+      - 192k
+      - -c:s
+      - mov_text
+      - -metadata:s:a:0
+      - language=ces
+      - -metadata:s:s:0
+      - language=ces
+      - -movflags
+      - +faststart
+      - -shortest
+      - "{{ remux_output }}"
+  register: remux_mp4
+  failed_when: remux_mp4.rc != 0
+  when:
+    - not remux_stat.stat.exists
+    - output_container == 'mp4'
+
+- name: Probe remuxed streams
+  ansible.builtin.command:
+    argv:
+      - ffprobe
+      - -v
+      - error
+      - -show_entries
+      - stream=codec_type
+      - -of
+      - csv=p=0
+      - "{{ remux_output }}"
+  register: remux_probe
+  changed_when: false
+  failed_when: remux_probe.rc != 0
+
+- name: Validate remuxed container
+  ansible.builtin.assert:
+    that:
+      - "'video' in remux_probe.stdout"
+      - "'audio' in remux_probe.stdout"
+      - output_container != 'mkv' or 'subtitle' in remux_probe.stdout
+    fail_msg: >-
+      Remuxed file {{ remux_output }} is missing expected streams.
+      ffprobe: {{ remux_probe.stdout }} {{ remux_probe.stderr }}
+
+- name: Show output path
+  ansible.builtin.debug:
+    msg: "Finished: {{ remux_output }}"

@@ -1,0 +1,132 @@
+---
+- name: Load last job facts
+  ansible.builtin.include_vars: "{{ work_root }}/current_job.yml"
+  when: video_id is not defined
+
+- name: Check existing Czech vocals
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/tts/czech_vocals.wav"
+  register: czech_vocals
+
+- name: Probe video duration
+  ansible.builtin.command:
+    argv:
+      - ffprobe
+      - -v
+      - error
+      - -show_entries
+      - format=duration
+      - -of
+      - default=noprint_wrappers=1:nokey=1
+      - "{{ job_dir }}/raw/{{ video_id }}.mp4"
+  register: video_duration
+  changed_when: false
+  failed_when: video_duration.rc != 0 or (video_duration.stdout | trim | length) == 0
+  when: not czech_vocals.stat.exists
+
+- name: Stat fine-tuned Czech F5 safetensors checkpoint
+  ansible.builtin.stat:
+    path: "{{ f5_ckpt_dir }}/model_last.safetensors"
+  register: f5_ckpt_st
+
+- name: Stat fine-tuned Czech F5 pt checkpoint
+  ansible.builtin.stat:
+    path: "{{ f5_ckpt_dir }}/model_last.pt"
+  register: f5_ckpt_pt
+
+- name: Stat fine-tuned Czech F5 vocab
+  ansible.builtin.stat:
+    path: "{{ f5_ckpt_dir }}/vocab.txt"
+  register: f5_vocab_stat
+
+- name: Set checkpoint path fact
+  ansible.builtin.set_fact:
+    f5_ckpt_file: "{{ (f5_ckpt_dir ~ '/model_last.safetensors') if f5_ckpt_st.stat.exists else ((f5_ckpt_dir ~ '/model_last.pt') if f5_ckpt_pt.stat.exists else '') }}"
+
+- name: Synthesize timed Czech speech (clone voice)
+  ansible.builtin.command:
+    argv: "{{ f5_clone_args + f5_ckpt_args }}"
+  vars:
+    f5_clone_args:
+      - "{{ venv_python }}"
+      - "{{ scripts_dir }}/synthesize_czech.py"
+      - --srt
+      - "{{ job_dir }}/subs/cs.srt"
+      - --out
+      - "{{ job_dir }}/tts/czech_vocals.wav"
+      - --duration
+      - "{{ video_duration.stdout | default('0') | trim }}"
+      - --device
+      - mps
+      - --voice-mode
+      - clone
+      - --vocals
+      - "{{ job_dir }}/audio/vocals.wav"
+      - --ref-out
+      - "{{ job_dir }}/audio/voice_ref.wav"
+      - --f5-model
+      - "{{ f5_model }}"
+      - --nfe-step
+      - "{{ f5_nfe_step | string }}"
+      - --max-speed
+      - "{{ tts_max_speed | string }}"
+      - --segments-dir
+      - "{{ job_dir }}/tts/segments"
+      - --whisper-model
+      - "{{ whisper_model }}"
+    f5_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
+  environment: "{{ pytorch_env }}"
+  register: f5_clone
+  failed_when: f5_clone.rc != 0
+  when:
+    - not czech_vocals.stat.exists
+    - voice_mode == 'clone'
+
+- name: Synthesize timed Czech speech (bundled voice)
+  ansible.builtin.command:
+    argv: "{{ f5_bundled_args + f5_ckpt_args }}"
+  vars:
+    f5_bundled_args:
+      - "{{ venv_python }}"
+      - "{{ scripts_dir }}/synthesize_czech.py"
+      - --srt
+      - "{{ job_dir }}/subs/cs.srt"
+      - --out
+      - "{{ job_dir }}/tts/czech_vocals.wav"
+      - --duration
+      - "{{ video_duration.stdout | default('0') | trim }}"
+      - --device
+      - mps
+      - --voice-mode
+      - bundled
+      - --ref-audio
+      - "{{ voice_ref_wav }}"
+      - --ref-text
+      - "{{ voice_ref_text }}"
+      - --f5-model
+      - "{{ f5_model }}"
+      - --nfe-step
+      - "{{ f5_nfe_step | string }}"
+      - --max-speed
+      - "{{ tts_max_speed | string }}"
+      - --segments-dir
+      - "{{ job_dir }}/tts/segments"
+      - --whisper-model
+      - "{{ whisper_model }}"
+    f5_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
+  environment: "{{ pytorch_env }}"
+  register: f5_bundled
+  failed_when: f5_bundled.rc != 0
+  when:
+    - not czech_vocals.stat.exists
+    - voice_mode == 'bundled'
+
+- name: Verify Czech vocals WAV
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/tts/czech_vocals.wav"
+  register: czech_vocals_after
+
+- name: Fail if Czech vocals are missing
+  ansible.builtin.fail:
+    msg: "synthesize_czech.py did not write {{ job_dir }}/tts/czech_vocals.wav"
+  when: not czech_vocals_after.stat.exists

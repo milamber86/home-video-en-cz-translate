@@ -1,0 +1,20 @@
+---
+- name: Local EN to CS video translation pipeline
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  roles:
+    - role: setup
+      tags: [setup]
+    - role: ollama
+      tags: [ollama]
+    - role: download
+      tags: [download]
+    - role: demucs
+      tags: [demucs]
+    - role: whisper_translate
+      tags: [whisper_translate, translate]
+    - role: f5_tts
+      tags: [f5_tts, tts]
+    - role: remux
+      tags: [remux]

@@ -1,0 +1,16 @@
+.venv/
+work/
+data/
+models/
+vendor/
+.ansible-tmp/
+*.retry
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+.pytest_cache/
+hf_cache/
+files/voices/*.wav
+!files/voices/README.md
+!files/voices/*.txt
