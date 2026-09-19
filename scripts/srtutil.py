@@ -15,9 +15,9 @@ _SFX_RE = re.compile(
     re.IGNORECASE,
 )
 _WS_RE = re.compile(r"\s+")
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 _MIN_CUE_SECONDS = 0.05
-_MAX_PACK_SECONDS = 7.0
-_MAX_PACK_WORDS = 22
+_HARD_PACK_SECONDS = 15.0
 
 
 def clean_caption(text: str) -> str:
@@ -87,7 +87,11 @@ def incremental_text(prev: str, nxt: str) -> str:
 
 
 def unroll_rolling_cues(cues: list[srt.Subtitle]) -> list[srt.Subtitle]:
-    """Turn sliding auto-captions into non-overlapping, sentence-sized cues."""
+    """Turn sliding auto-captions into non-overlapping cues.
+
+    Packs until a sentence end (`.?!…`) or a 15s hard cap. Mid-sentence 7s
+    flushes are not used; `cues_to_sentences` splits on real punctuation.
+    """
     if not cues:
         return []
 
@@ -134,16 +138,95 @@ def unroll_rolling_cues(cues: list[srt.Subtitle]) -> list[srt.Subtitle]:
             buf_words.extend(words)
         text = " ".join(buf_words)
         dur = (buf_end - buf_start).total_seconds()
-        ended = text.endswith((".", "?", "!"))
-        if ended and (dur >= 1.5 or len(buf_words) >= 6):
+        if text.endswith((".", "?", "!", "…")):
             flush()
-        elif dur >= _MAX_PACK_SECONDS or len(buf_words) >= _MAX_PACK_WORDS:
+        elif dur >= _HARD_PACK_SECONDS:
             flush()
     flush()
     return packed
 
 
-def load_srt(path: str | Path) -> list[srt.Subtitle]:
+def _cue_spans(cues: list[srt.Subtitle]) -> tuple[str, list[dict]]:
+    spans: list[dict] = []
+    parts: list[str] = []
+    offset = 0
+    for cue in cues:
+        text = (cue.content or "").strip()
+        if not text:
+            continue
+        if parts:
+            offset += 1
+        char_start = offset
+        char_end = offset + len(text)
+        spans.append(
+            {
+                "start": cue.start,
+                "end": cue.end,
+                "char_start": char_start,
+                "char_end": char_end,
+            }
+        )
+        parts.append(text)
+        offset = char_end
+    return " ".join(parts), spans
+
+
+def _time_at(spans: list[dict], char_idx: int, *, at_end: bool) -> timedelta:
+    if not spans:
+        return timedelta(0)
+    if char_idx <= spans[0]["char_start"]:
+        return spans[0]["start"]
+    last = spans[-1]
+    if char_idx >= last["char_end"]:
+        return last["end"]
+    for sp in spans:
+        starts = sp["char_start"]
+        ends = sp["char_end"]
+        if starts <= char_idx < ends or (at_end and char_idx == ends):
+            n = max(ends - starts, 1)
+            local = min(max(char_idx - starts, 0), n)
+            frac = local / n
+            dur = (sp["end"] - sp["start"]).total_seconds()
+            return sp["start"] + timedelta(seconds=dur * frac)
+    return last["end"]
+
+
+def cues_to_sentences(cues: list[srt.Subtitle]) -> list[srt.Subtitle]:
+    """Merge/split cues so each item is one sentence with interpolated times."""
+    if not cues:
+        return []
+    full, spans = _cue_spans(cues)
+    if not full or not spans:
+        return []
+    chunks = [p.strip() for p in _SENT_SPLIT_RE.split(full) if p.strip()]
+    if not chunks:
+        return _renumber(cues)
+
+    out: list[srt.Subtitle] = []
+    cursor = 0
+    for chunk in chunks:
+        idx = full.find(chunk, cursor)
+        if idx < 0:
+            idx = cursor
+        start_i = idx
+        end_i = idx + len(chunk)
+        start = _time_at(spans, start_i, at_end=False)
+        end = _time_at(spans, end_i, at_end=True)
+        if end <= start:
+            end = start + timedelta(seconds=_MIN_CUE_SECONDS)
+        out.append(
+            srt.Subtitle(
+                index=len(out) + 1,
+                start=start,
+                end=end,
+                content=chunk,
+            )
+        )
+        cursor = end_i
+    return _renumber(out)
+
+
+def load_srt(path: str | Path, *, sentences: bool = True) -> list[srt.Subtitle]:
     raw = Path(path).read_text(encoding="utf-8")
     cues = list(srt.parse(raw))
     cleaned: list[srt.Subtitle] = []
@@ -164,6 +247,8 @@ def load_srt(path: str | Path) -> list[srt.Subtitle]:
         )
     if is_rolling_captions(cleaned):
         cleaned = unroll_rolling_cues(cleaned)
+    if sentences:
+        cleaned = cues_to_sentences(cleaned)
     if not cleaned:
         raise ValueError(f"No usable cues in {path}")
     return _renumber(cleaned)
@@ -200,4 +285,4 @@ def segments_to_cues(segments: list[dict]) -> list[srt.Subtitle]:
         )
     if not cues:
         raise ValueError("Whisper returned no subtitle cues")
-    return _renumber(cues)
+    return cues_to_sentences(cues)

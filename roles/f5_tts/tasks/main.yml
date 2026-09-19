@@ -3,6 +3,18 @@
   ansible.builtin.include_vars: "{{ work_root }}/current_job.yml"
   when: video_id is not defined
 
+- name: Remove previous Czech vocals when forcing TTS
+  ansible.builtin.file:
+    path: "{{ job_dir }}/tts/czech_vocals.wav"
+    state: absent
+  when: force_tts | default(false) | bool
+
+- name: Clear TTS segment cache when forcing TTS
+  ansible.builtin.file:
+    path: "{{ job_dir }}/tts/segments"
+    state: absent
+  when: force_tts | default(false) | bool
+
 - name: Check existing Czech vocals
   ansible.builtin.stat:
     path: "{{ job_dir }}/tts/czech_vocals.wav"
@@ -45,7 +57,7 @@
 
 - name: Synthesize timed Czech speech (clone voice)
   ansible.builtin.command:
-    argv: "{{ f5_clone_args + f5_ckpt_args }}"
+    argv: "{{ f5_clone_args + f5_ckpt_args + f5_fresh_args }}"
   vars:
     f5_clone_args:
       - "{{ venv_python }}"
@@ -58,6 +70,8 @@
       - "{{ video_duration.stdout | default('0') | trim }}"
       - --device
       - mps
+      - --engine
+      - "{{ tts_engine }}"
       - --voice-mode
       - clone
       - --vocals
@@ -74,7 +88,12 @@
       - "{{ job_dir }}/tts/segments"
       - --whisper-model
       - "{{ whisper_model }}"
+      - --piper-model
+      - "{{ piper_voice_dir }}/{{ piper_voice }}.onnx"
+      - --xtts-python
+      - "{{ xtts_python }}"
     f5_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
+    f5_fresh_args: "{{ ['--fresh'] if (force_tts | default(false) | bool) else [] }}"
   environment: "{{ pytorch_env }}"
   register: f5_clone
   failed_when: f5_clone.rc != 0
@@ -84,7 +103,7 @@
 
 - name: Synthesize timed Czech speech (bundled voice)
   ansible.builtin.command:
-    argv: "{{ f5_bundled_args + f5_ckpt_args }}"
+    argv: "{{ f5_bundled_args + f5_ckpt_args + f5_fresh_args }}"
   vars:
     f5_bundled_args:
       - "{{ venv_python }}"
@@ -97,6 +116,8 @@
       - "{{ video_duration.stdout | default('0') | trim }}"
       - --device
       - mps
+      - --engine
+      - "{{ tts_engine }}"
       - --voice-mode
       - bundled
       - --ref-audio
@@ -113,7 +134,12 @@
       - "{{ job_dir }}/tts/segments"
       - --whisper-model
       - "{{ whisper_model }}"
+      - --piper-model
+      - "{{ piper_voice_dir }}/{{ piper_voice }}.onnx"
+      - --xtts-python
+      - "{{ xtts_python }}"
     f5_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
+    f5_fresh_args: "{{ ['--fresh'] if (force_tts | default(false) | bool) else [] }}"
   environment: "{{ pytorch_env }}"
   register: f5_bundled
   failed_when: f5_bundled.rc != 0

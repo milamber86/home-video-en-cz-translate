@@ -37,6 +37,18 @@ ollama_model: qwen2.5:14b
 ollama_bind: 127.0.0.1:11434
 marian_model: Helsinki-NLP/opus-mt-tc-big-en-ces_slk
 
+force_translate: false
+force_tts: false
+
+# Piper (bundled / stock Czech voice)
+piper_voice_dir: "{{ playbook_dir }}/models/piper"
+piper_voice: cs_CZ-jirka-medium
+piper_voice_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/cs/cs_CZ/jirka/medium
+
+# XTTS-v2 lives in an isolated venv (old transformers).
+xtts_venv: "{{ playbook_dir }}/.venv-xtts"
+xtts_python: "{{ xtts_venv }}/bin/python"
+
 # Voice / TTS
 voice_mode: clone
 voice_ref_wav: "{{ playbook_dir }}/files/voices/czech_default_ref.wav"
@@ -45,6 +57,7 @@ f5_model: F5TTS_v1_Base
 f5_nfe_step: 32
 tts_max_speed: 1.35
 f5_ckpt_dir: "{{ playbook_dir }}/models/f5_czech"
+tts_engine: auto
 
 # Czech F5 fine-tune
 f5_train_dataset: mozilla-foundation/common_voice_17_0

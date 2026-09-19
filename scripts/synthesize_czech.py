@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Generate timed Czech speech from an SRT with F5-TTS on Apple Silicon MPS."""
+"""Generate timed Czech speech from an SRT (Piper, XTTS-v2, or Czech F5)."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 import subprocess
 import sys
 import tempfile
+import wave
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -32,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output czech_vocals.wav")
     p.add_argument("--duration", type=float, help="Video duration seconds (required unless --smoke-test)")
     p.add_argument("--device", default="mps")
+    p.add_argument("--engine", default="auto", choices=("auto", "f5", "xtts", "piper"))
     p.add_argument("--voice-mode", choices=("clone", "bundled"), default="clone")
     p.add_argument("--vocals", help="Original vocals.wav for clone mode")
     p.add_argument("--ref-audio", help="Bundled or explicit reference WAV")
@@ -45,6 +48,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--segments-dir", help="Optional directory for per-cue WAVs")
     p.add_argument("--whisper-model", default="mlx-community/whisper-large-v3-mlx")
     p.add_argument("--sample-rate", type=int, default=48000)
+    p.add_argument("--piper-model", default="", help="Piper ONNX voice (cs_CZ-jirka-medium.onnx)")
+    p.add_argument("--xtts-python", default="", help="Interpreter for isolated .venv-xtts")
+    p.add_argument("--fresh", action="store_true", help="Ignore existing per-cue WAVs")
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--smoke-text", default="Za svítání šel dům přes louku.")
     return p.parse_args()
@@ -100,7 +106,7 @@ def pick_reference_clip(vocals: Path, dest: Path, target_sec: float = 10.0) -> P
 def transcribe_ref(path: Path, model: str) -> str:
     import mlx_whisper
 
-    apple_device.log(f"Transcribing voice reference with mlx-whisper")
+    apple_device.log("Transcribing voice reference with mlx-whisper")
     result = mlx_whisper.transcribe(
         str(path),
         path_or_hf_repo=model,
@@ -123,9 +129,34 @@ def read_ref_text(value: str | None) -> str:
     return value.strip()
 
 
-def normalize_czech(text: str, using_finetune: bool) -> str:
+def czech_f5_ready(args: argparse.Namespace) -> bool:
+    return bool(
+        args.ckpt
+        and Path(args.ckpt).is_file()
+        and args.vocab
+        and Path(args.vocab).is_file()
+    )
+
+
+def select_engine(args: argparse.Namespace) -> str:
+    requested = (args.engine or "auto").strip().lower()
+    if requested == "auto":
+        if czech_f5_ready(args):
+            return "f5"
+        if args.voice_mode == "clone":
+            return "xtts"
+        return "piper"
+    if requested == "f5" and not czech_f5_ready(args):
+        raise SystemExit(
+            "engine=f5 requires a Czech fine-tune (--ckpt and --vocab). "
+            "Official F5TTS_v1_Base is ZH+EN and is not used for Czech."
+        )
+    return requested
+
+
+def normalize_czech(text: str, engine: str, using_finetune: bool) -> str:
     text = (text or "").strip()
-    if not using_finetune:
+    if engine == "f5" and not using_finetune:
         text = text.translate(BASE_GRAPHEME_FIX)
     if text and text[-1] not in ".!?…":
         text += "."
@@ -202,15 +233,94 @@ def load_f5(args: argparse.Namespace):
     device = apple_device.device_str(args.device)
     patch_f5_serial_mps(device)
     apple_device.log(f"Loading F5-TTS on device={device}")
-    ckpt = args.ckpt if args.ckpt and Path(args.ckpt).is_file() else ""
-    vocab = args.vocab if args.vocab and Path(args.vocab).is_file() else ""
-    kwargs = {"model": args.f5_model, "device": device}
-    if ckpt:
-        kwargs["ckpt_file"] = ckpt
-        apple_device.log(f"Using fine-tuned checkpoint {ckpt}")
-    if vocab:
-        kwargs["vocab_file"] = vocab
-    return F5TTS(**kwargs), bool(ckpt and vocab), device
+    kwargs = {"model": args.f5_model, "device": device, "ckpt_file": args.ckpt}
+    if args.vocab:
+        kwargs["vocab_file"] = args.vocab
+    apple_device.log(f"Using Czech F5 checkpoint {args.ckpt}")
+    return F5TTS(**kwargs), device
+
+
+def piper_to_wav(text: str, model: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from piper import PiperVoice
+    except ImportError:
+        piper_bin = shutil.which("piper")
+        if not piper_bin:
+            raise SystemExit("piper-tts is not installed and no piper CLI is on PATH")
+        proc = subprocess.run(
+            [piper_bin, "--model", str(model), "--output_file", str(dest)],
+            input=text,
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0 or not dest.is_file():
+            raise RuntimeError(f"piper CLI failed: {proc.stderr}")
+        return
+
+    try:
+        voice = PiperVoice.load(str(model), use_cuda=False)
+    except TypeError:
+        voice = PiperVoice.load(str(model))
+    with wave.open(str(dest), "wb") as wf:
+        if hasattr(voice, "synthesize_wav"):
+            voice.synthesize_wav(text, wf)
+            return
+        chunks = list(voice.synthesize(text))
+        if not chunks:
+            raise RuntimeError("Piper returned no audio")
+        first = chunks[0]
+        sample_rate = getattr(first, "sample_rate", 22050)
+        sample_width = getattr(first, "sample_width", 2)
+        sample_channels = getattr(first, "sample_channels", 1)
+        wf.setnchannels(sample_channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        for chunk in chunks:
+            audio_bytes = getattr(chunk, "audio_int16_bytes", None)
+            if audio_bytes is None:
+                audio_int16 = getattr(chunk, "audio_int16", None)
+                if audio_int16 is None:
+                    raise RuntimeError("Unexpected Piper chunk type")
+                audio_bytes = np.asarray(audio_int16, dtype=np.int16).tobytes()
+            wf.writeframes(audio_bytes)
+
+
+def xtts_batch(xtts_python: Path, speaker: Path, jobs: list[dict]) -> None:
+    if not xtts_python.is_file():
+        raise SystemExit(
+            f"XTTS interpreter missing: {xtts_python}. "
+            "Re-run the setup role to create .venv-xtts."
+        )
+    if not jobs:
+        return
+    with tempfile.NamedTemporaryFile(
+        prefix="xtts_jobs_", suffix=".json", delete=False, mode="w", encoding="utf-8"
+    ) as fh:
+        json.dump(jobs, fh, ensure_ascii=False)
+        jobs_path = Path(fh.name)
+    try:
+        proc = subprocess.run(
+            [
+                str(xtts_python),
+                str(SCRIPTS_DIR / "xtts_synth.py"),
+                "--speaker",
+                str(speaker),
+                "--language",
+                "cs",
+                "--jobs",
+                str(jobs_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"xtts_synth.py failed ({proc.returncode})\n"
+                f"{proc.stderr}\n{proc.stdout}"
+            )
+    finally:
+        jobs_path.unlink(missing_ok=True)
 
 
 def fit_to_slot(
@@ -311,7 +421,9 @@ def overlay(pieces: list[tuple[float, np.ndarray]], duration: float, sr: int) ->
     return canvas
 
 
-def resolve_reference(args: argparse.Namespace, job_ref: Path) -> tuple[Path, str]:
+def resolve_speaker(args: argparse.Namespace, job_ref: Path, engine: str) -> tuple[Path | None, str]:
+    if engine == "piper":
+        return None, ""
     if args.voice_mode == "bundled":
         if not args.ref_audio or not Path(args.ref_audio).is_file():
             raise SystemExit(
@@ -319,20 +431,23 @@ def resolve_reference(args: argparse.Namespace, job_ref: Path) -> tuple[Path, st
                 "(see files/voices/README.md)"
             )
         text = read_ref_text(args.ref_text)
-        if not text:
-            raise SystemExit("Bundled voice requires a non-empty reference transcript")
+        if engine == "f5" and not text:
+            raise SystemExit("Bundled F5 voice requires a non-empty reference transcript")
         return Path(args.ref_audio), text
 
     if args.ref_audio and Path(args.ref_audio).is_file():
-        text = read_ref_text(args.ref_text) or transcribe_ref(
-            Path(args.ref_audio), args.whisper_model
-        )
-        return Path(args.ref_audio), text
+        ref = Path(args.ref_audio)
+        text = read_ref_text(args.ref_text)
+        if engine == "f5" and not text:
+            text = transcribe_ref(ref, args.whisper_model)
+        return ref, text
 
     if not args.vocals or not Path(args.vocals).is_file():
         raise SystemExit("voice_mode=clone requires --vocals pointing at vocals.wav")
     ref = pick_reference_clip(Path(args.vocals), job_ref)
-    text = read_ref_text(args.ref_text) or transcribe_ref(ref, args.whisper_model)
+    text = read_ref_text(args.ref_text)
+    if engine == "f5" and not text:
+        text = transcribe_ref(ref, args.whisper_model)
     return ref, text
 
 
@@ -342,83 +457,133 @@ def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(audio))))
 
 
+def f5_infer(tts, ref_audio: Path, ref_text: str, text: str, args, raw: Path, device: str):
+    wav, sr, _ = tts.infer(
+        ref_file=str(ref_audio),
+        ref_text=ref_text,
+        gen_text=text,
+        nfe_step=args.nfe_step,
+        speed=1.0,
+        file_wave=str(raw),
+    )
+    sync_mps(device)
+    if wav is None:
+        raise RuntimeError("F5-TTS returned no audio")
+    return int(sr)
+
+
 def main() -> int:
     args = parse_args()
     if not args.smoke_test and (not args.srt or args.duration is None):
         raise SystemExit("--srt and --duration are required unless --smoke-test")
+    engine = select_engine(args)
+    apple_device.log(f"TTS engine={engine} voice_mode={args.voice_mode}")
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     segments_dir = Path(args.segments_dir) if args.segments_dir else out_path.parent / "segments"
+    if args.fresh and segments_dir.is_dir():
+        shutil.rmtree(segments_dir)
     segments_dir.mkdir(parents=True, exist_ok=True)
 
     default_ref = Path(args.ref_out) if args.ref_out else out_path.parent / "voice_ref.wav"
-    ref_audio, ref_text = resolve_reference(args, default_ref)
-    tts, using_finetune, tts_device = load_f5(args)
-    apple_device.log(f"Reference audio={ref_audio} text={ref_text[:80]!r}")
+    speaker, ref_text = resolve_speaker(args, default_ref, engine)
+    tts = None
+    tts_device = "cpu"
+    using_finetune = engine == "f5"
+    if engine == "f5":
+        tts, tts_device = load_f5(args)
+        apple_device.log(f"Reference audio={speaker} text={ref_text[:80]!r}")
+    elif engine == "xtts":
+        if speaker is None:
+            raise SystemExit("XTTS clone requires a speaker WAV")
+        apple_device.log(f"XTTS speaker={speaker}")
+    else:
+        model = Path(args.piper_model) if args.piper_model else Path()
+        if not model.is_file():
+            raise SystemExit(
+                "Piper voice ONNX missing. Pass --piper-model "
+                "models/piper/cs_CZ-jirka-medium.onnx"
+            )
+        apple_device.log(f"Piper voice={model}")
 
     if args.smoke_test:
-        text = normalize_czech(args.smoke_text, using_finetune)
-        wav, sr, _ = tts.infer(
-            ref_file=str(ref_audio),
-            ref_text=ref_text,
-            gen_text=text,
-            nfe_step=args.nfe_step,
-            speed=1.0,
-        )
-        sync_mps(tts_device)
-        if wav is None:
-            raise SystemExit("F5-TTS smoke test returned no audio")
-        audio = np.asarray(wav, dtype=np.float32)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=-1)
+        text = normalize_czech(args.smoke_text, engine, using_finetune)
+        with tempfile.TemporaryDirectory(prefix="ttssmoke_") as tmp:
+            raw = Path(tmp) / "smoke.wav"
+            if engine == "f5":
+                f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
+            elif engine == "xtts":
+                xtts_python = Path(args.xtts_python) if args.xtts_python else Path()
+                xtts_batch(
+                    xtts_python,
+                    speaker,
+                    [{"text": text, "out": str(raw)}],
+                )
+            else:
+                piper_to_wav(text, Path(args.piper_model), raw)
+            audio, sr = load_mono(raw)
         dur = len(audio) / float(sr)
         energy = rms(audio)
         sf.write(str(out_path), audio, int(sr))
         apple_device.log(f"Smoke test duration={dur:.2f}s rms={energy:.5f}")
         if dur < 0.3 or energy < 1e-4:
-            raise SystemExit("F5-TTS smoke test produced silent or too-short audio")
+            raise SystemExit("TTS smoke test produced silent or too-short audio")
         return 0
 
-    cues = load_srt(args.srt)
+    cues = load_srt(args.srt, sentences=False)
     pieces: list[tuple[float, np.ndarray]] = []
     gen_sr = 24000
+    pending_xtts: list[dict] = []
+    pending_meta: list[tuple[int, Path, Path, float, float]] = []
 
-    with tempfile.TemporaryDirectory(prefix="f5cue_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="ttscue_") as tmp:
         tmp_dir = Path(tmp)
         for i, cue in enumerate(cues, start=1):
-            text = normalize_czech(cue.content, using_finetune)
+            text = normalize_czech(cue.content, engine, using_finetune)
             if not text:
                 continue
             fitted = segments_dir / f"{i:04d}.wav"
             start = cue.start.total_seconds()
-            if usable_segment(fitted):
+            slot = max(cue_seconds(cue), 0.08)
+            if not args.fresh and usable_segment(fitted):
                 samples, seg_sr = load_mono(fitted)
                 gen_sr = int(seg_sr)
                 apple_device.log(f"TTS cue {i}/{len(cues)} resume {fitted.name}")
                 pieces.append((start, samples))
                 continue
             raw = tmp_dir / f"{i:04d}_raw.wav"
-            apple_device.log(f"TTS cue {i}/{len(cues)} ({cue_seconds(cue):.2f}s): {text[:80]}")
-            wav, sr, _ = tts.infer(
-                ref_file=str(ref_audio),
-                ref_text=ref_text,
-                gen_text=text,
-                nfe_step=args.nfe_step,
-                speed=1.0,
-                file_wave=str(raw),
-            )
-            sync_mps(tts_device)
-            if wav is None:
-                raise RuntimeError(f"F5-TTS returned no audio for cue {i}")
-            gen_sr = int(sr)
-            slot = max(cue_seconds(cue), 0.08)
+            apple_device.log(f"TTS cue {i}/{len(cues)} ({slot:.2f}s): {text[:80]}")
+            if engine == "xtts":
+                pending_xtts.append({"text": text, "out": str(raw)})
+                pending_meta.append((i, raw, fitted, start, slot))
+                continue
+            if engine == "f5":
+                gen_sr = f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
+            else:
+                piper_to_wav(text, Path(args.piper_model), raw)
             samples = fit_to_slot(raw, fitted, slot, args.max_speed, tmp_dir)
+            gen_sr = int(sf.info(str(fitted)).samplerate)
             pieces.append((start, samples))
+
+        if pending_xtts:
+            xtts_python = Path(args.xtts_python) if args.xtts_python else Path()
+            xtts_batch(xtts_python, speaker, pending_xtts)
+            for _i, raw, fitted, start, slot in pending_meta:
+                if not raw.is_file():
+                    raise RuntimeError(f"XTTS did not write {raw}")
+                samples = fit_to_slot(raw, fitted, slot, args.max_speed, tmp_dir)
+                gen_sr = int(sf.info(str(fitted)).samplerate)
+                pieces.append((start, samples))
 
     if not pieces:
         raise SystemExit("No Czech speech segments were generated")
 
-    duration = max(args.duration, pieces[-1][0] + 0.1)
+    last = max(
+        (start + (len(samples) / float(gen_sr) if gen_sr else 0.0))
+        for start, samples in pieces
+    )
+    duration = max(args.duration, last + 0.1)
     canvas = overlay(pieces, duration, gen_sr)
     canvas_48k = resample_mono(canvas, gen_sr, args.sample_rate)
     stereo = np.stack([canvas_48k, canvas_48k], axis=1)

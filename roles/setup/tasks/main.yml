@@ -177,6 +177,7 @@
       - git
       - ffmpeg
       - uv
+      - espeak-ng
       - "{{ python_brew_pkg }}"
   register: brew_install
   environment: "{{ brew_env }}"
@@ -240,6 +241,53 @@
       - "{{ playbook_dir }}/requirements.txt"
   register: uv_pip
   changed_when: "'Installed' in (uv_pip.stdout | default('')) or 'Uninstalled' in (uv_pip.stdout | default(''))"
+  environment: "{{ brew_env }}"
+
+- name: Create Piper voice directory
+  ansible.builtin.file:
+    path: "{{ piper_voice_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download Piper Czech voice
+  ansible.builtin.get_url:
+    url: "{{ piper_voice_url }}/{{ piper_voice }}.onnx"
+    dest: "{{ piper_voice_dir }}/{{ piper_voice }}.onnx"
+    mode: "0644"
+    timeout: 120
+
+- name: Download Piper Czech voice config
+  ansible.builtin.get_url:
+    url: "{{ piper_voice_url }}/{{ piper_voice }}.onnx.json"
+    dest: "{{ piper_voice_dir }}/{{ piper_voice }}.onnx.json"
+    mode: "0644"
+    timeout: 60
+
+- name: Create XTTS virtualenv
+  ansible.builtin.command:
+    argv:
+      - "{{ brew_bin }}/uv"
+      - venv
+      - "{{ xtts_venv }}"
+      - --python
+      - "{{ brew_python }}"
+    creates: "{{ xtts_python }}"
+  environment: "{{ brew_env }}"
+
+- name: Install XTTS dependencies into isolated venv
+  ansible.builtin.command:
+    argv:
+      - "{{ brew_bin }}/uv"
+      - pip
+      - install
+      - --python
+      - "{{ xtts_python }}"
+      - -r
+      - "{{ playbook_dir }}/requirements-xtts.txt"
+  register: uv_pip_xtts
+  changed_when: >-
+    'Installed' in (uv_pip_xtts.stdout | default(''))
+    or 'Uninstalled' in (uv_pip_xtts.stdout | default(''))
   environment: "{{ brew_env }}"
 
 - name: Verify ffmpeg

@@ -23,7 +23,6 @@ apple_device.bootstrap_mps_fallback()
 
 import srt  # noqa: E402
 from srtutil import (  # noqa: E402
-    is_rolling_captions,
     load_srt,
     save_srt,
     segments_to_cues,
@@ -31,13 +30,15 @@ from srtutil import (  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are a professional audiovisual translator from English to Czech. "
-    "Translate each English subtitle cue into natural, spoken Czech. "
-    "Keep roughly the same length as the source. "
+    "Translate each English subtitle sentence into natural, spoken Czech. "
+    "The items are consecutive sentences from the same talk, not isolated fragments. "
+    "Preserve clause links and finish each thought; do not restart meaning at "
+    "array boundaries. Keep roughly the same length as the source. "
     "Do not add explanations, numbering, or timestamps. "
-    "Any previous Czech cue is context only: do not translate it and do not "
-    "include it in the output. "
+    "Previous sentences given as context are read-only: do not translate or "
+    "repeat them in the output. "
     "Return ONLY a JSON array of Czech strings with exactly the same length "
-    "and order as the input cues array."
+    "and order as the input sentences array."
 )
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
@@ -190,7 +191,7 @@ def ollama_translate_batch(
     url: str,
     model: str,
     texts: list[str],
-    prev: str,
+    context: list[tuple[str, str]],
     timeout: float,
 ) -> list[str]:
     import httpx
@@ -199,13 +200,16 @@ def ollama_translate_batch(
         return [""] * len(texts)
 
     user_parts: list[str] = []
-    if prev.strip():
+    if context:
         user_parts.append(
-            "Previous Czech cue (context only, do not translate or output it):\n"
-            + prev.strip()
+            "Previous sentences (read-only context, do not translate or output):\n"
+            + json.dumps(
+                [{"en": en, "cs": cs} for en, cs in context],
+                ensure_ascii=False,
+            )
         )
     user_parts.append(
-        "Translate this JSON array of English cues. Return a JSON array of "
+        "Translate this JSON array of English sentences. Return a JSON array of "
         f"exactly {len(texts)} Czech strings:"
     )
     user_parts.append(json.dumps(texts, ensure_ascii=False))
@@ -219,6 +223,7 @@ def ollama_translate_batch(
         ],
     }
     last_exc: Exception | None = None
+    prev_blob = " ".join(cs for _, cs in context)
     for use_json_format in (True, False):
         body_payload = dict(payload)
         if use_json_format:
@@ -233,9 +238,9 @@ def ollama_translate_batch(
             body = r.json()
             content = (body.get("message") or {}).get("content") or ""
             raw = parse_json_array(content)
-            out = align_translations(raw, texts, prev)
+            out = align_translations(raw, texts, prev_blob)
             if any(not item for item in out):
-                raise ValueError("Ollama returned an empty cue")
+                raise ValueError("Ollama returned an empty sentence")
             return out
         except Exception as exc:
             last_exc = exc
@@ -313,33 +318,37 @@ def translate_cues(
     bs = max(1, args.batch_size)
     for i in range(0, len(texts), bs):
         chunk = texts[i : i + bs]
-        prev = translated[-1] if translated else ""
+        ctx_en = texts[max(0, i - 2) : i]
+        ctx = list(zip(ctx_en, translated[-len(ctx_en) :] if ctx_en else []))
         try:
             translated.extend(
                 ollama_translate_batch(
-                    args.ollama_url, model, chunk, prev, args.ollama_timeout
+                    args.ollama_url, model, chunk, ctx, args.ollama_timeout
                 )
             )
         except Exception as exc:
-            apple_device.log(f"Ollama batch failed ({exc}); retrying per cue")
+            apple_device.log(f"Ollama batch failed ({exc}); retrying per sentence")
             for j, cue_text in enumerate(chunk):
-                cue_prev = translated[-1] if translated else prev
+                one_en = texts[max(0, i + j - 2) : i + j]
+                one_ctx = list(
+                    zip(one_en, translated[-len(one_en) :] if one_en else [])
+                )
                 try:
                     one = ollama_translate_batch(
                         args.ollama_url,
                         model,
                         [cue_text],
-                        cue_prev,
+                        one_ctx,
                         args.ollama_timeout,
                     )
                     translated.append(one[0])
                 except Exception as cue_exc:
                     if backend == "ollama_only":
                         raise SystemExit(
-                            f"Ollama failed on cue {i + j + 1}: {cue_exc}"
+                            f"Ollama failed on sentence {i + j + 1}: {cue_exc}"
                         ) from cue_exc
                     apple_device.log(
-                        f"Ollama failed on cue {i + j + 1}; remaining cues use Marian"
+                        f"Ollama failed on sentence {i + j + 1}; remaining use Marian"
                     )
                     rest = texts[len(translated) :]
                     translated.extend(via_marian(rest))
@@ -352,20 +361,11 @@ def translate_cues(
 def english_cues(args: argparse.Namespace) -> list[srt.Subtitle]:
     if args.en_srt and Path(args.en_srt).is_file():
         try:
-            cues = load_srt(args.en_srt)
+            cues = load_srt(args.en_srt, sentences=True)
+            apple_device.log(f"Using English SRT as {len(cues)} sentences")
+            return cues
         except ValueError as exc:
             apple_device.log(f"Ignoring unusable SRT {args.en_srt}: {exc}")
-            cues = None
-        else:
-            if is_rolling_captions(cues):
-                apple_device.log(
-                    f"Downloaded SRT looks like rolling auto-captions ({len(cues)} cues); "
-                    "using Whisper on vocals instead"
-                )
-                cues = None
-            else:
-                apple_device.log(f"Using downloaded English SRT ({len(cues)} cues)")
-                return cues
     if not args.audio or not Path(args.audio).is_file():
         raise SystemExit("Need --en-srt with cues or a readable --audio file")
     return transcribe_mlx(args.audio, args.whisper_model)
@@ -381,7 +381,7 @@ def main() -> int:
     cues = english_cues(args)
     save_srt(out_en, cues)
     texts = [c.content for c in cues]
-    apple_device.log(f"Translating {len(texts)} cues to Czech")
+    apple_device.log(f"Translating {len(texts)} sentences to Czech")
     czech = translate_cues(texts, args)
     if len(czech) != len(cues):
         raise SystemExit(

@@ -8,6 +8,10 @@
     path: "{{ job_dir }}/subs/cs.srt"
   register: cs_srt
 
+- name: Skip translation unless missing or forced
+  ansible.builtin.set_fact:
+    skip_translate: "{{ cs_srt.stat.exists and not (force_translate | default(false) | bool) }}"
+
 - name: Find downloaded English SRT
   ansible.builtin.find:
     paths: "{{ job_dir }}/raw"
@@ -16,7 +20,7 @@
       - "{{ video_id }}.en-*.srt"
       - "{{ video_id }}.en*.srt"
   register: en_subs
-  when: not cs_srt.stat.exists
+  when: not skip_translate
 
 - name: Translate using downloaded English SRT
   ansible.builtin.command:
@@ -47,7 +51,7 @@
   register: whisper_with_srt
   failed_when: whisper_with_srt.rc != 0
   when:
-    - not cs_srt.stat.exists
+    - not skip_translate
     - (en_subs.files | default([]) | length) > 0
 
 - name: Transcribe vocals and translate to Czech
@@ -77,7 +81,7 @@
   register: whisper_from_audio
   failed_when: whisper_from_audio.rc != 0
   when:
-    - not cs_srt.stat.exists
+    - not skip_translate
     - (en_subs.files | default([]) | length) == 0
 
 - name: Verify Czech SRT

@@ -7,6 +7,12 @@
   ansible.builtin.set_fact:
     remux_output: "{{ job_dir }}/output/{{ video_id }}.cs.{{ output_container }}"
 
+- name: Remove previous remux when forcing translate or TTS
+  ansible.builtin.file:
+    path: "{{ remux_output }}"
+    state: absent
+  when: (force_tts | default(false) | bool) or (force_translate | default(false) | bool)
+
 - name: Check existing remux output
   ansible.builtin.stat:
     path: "{{ remux_output }}"
