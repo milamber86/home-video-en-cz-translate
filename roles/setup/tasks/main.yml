@@ -57,7 +57,7 @@
       ansible.builtin.git:
         repo: https://github.com/Homebrew/brew
         dest: /opt/homebrew
-        version: master
+        version: main
         depth: 1
         update: false
   rescue:
@@ -82,6 +82,52 @@
   when:
     - ansible_architecture | default(ansible_machine) == "arm64"
     - not as_homebrew.stat.exists
+
+- name: Read Homebrew git branch
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - /opt/homebrew
+      - rev-parse
+      - --abbrev-ref
+      - HEAD
+  register: brew_head
+  changed_when: false
+  when:
+    - ansible_architecture | default(ansible_machine) == "arm64"
+    - as_homebrew.stat.exists
+
+- name: Fetch Homebrew main
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - /opt/homebrew
+      - fetch
+      - --depth
+      - "1"
+      - origin
+      - main
+  when:
+    - ansible_architecture | default(ansible_machine) == "arm64"
+    - as_homebrew.stat.exists
+    - (brew_head.stdout | default('') | trim) != "main"
+
+- name: Check out Homebrew main
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - /opt/homebrew
+      - checkout
+      - -B
+      - main
+      - FETCH_HEAD
+  when:
+    - ansible_architecture | default(ansible_machine) == "arm64"
+    - as_homebrew.stat.exists
+    - (brew_head.stdout | default('') | trim) != "main"
 
 - name: Verify native brew prefix is /opt/homebrew
   ansible.builtin.command:
