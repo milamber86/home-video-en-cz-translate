@@ -110,6 +110,7 @@ def transcribe_ref(path: Path, model: str) -> str:
     text = (result.get("text") or "").strip()
     if not text:
         raise RuntimeError(f"Empty transcript for reference audio {path}")
+    release_mlx()
     return text
 
 
@@ -131,10 +132,75 @@ def normalize_czech(text: str, using_finetune: bool) -> str:
     return text
 
 
+class _DoneFuture:
+    def __init__(self, value):
+        self._value = value
+
+    def result(self, timeout=None):
+        return self._value
+
+
+class _SerialExecutor:
+    """F5-TTS infer_batch_process uses ThreadPoolExecutor for text chunks.
+
+    Two Metal command encoders on one MPS buffer abort the process:
+    `A command encoder is already encoding to this command buffer`.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def submit(self, fn, *args, **kwargs):
+        return _DoneFuture(fn(*args, **kwargs))
+
+
+def patch_f5_serial_mps(device: str) -> None:
+    if device != "mps":
+        return
+    import f5_tts.infer.utils_infer as infer_utils
+
+    infer_utils.ThreadPoolExecutor = _SerialExecutor
+    apple_device.log("F5-TTS: serial MPS inference (avoid Metal encoder clash)")
+
+
+def sync_mps(device: str) -> None:
+    if device != "mps":
+        return
+    import torch
+
+    if torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
+
+def release_mlx() -> None:
+    try:
+        import mlx.core as mx
+
+        mx.metal.clear_cache()
+    except Exception:
+        pass
+
+
+def usable_segment(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 1000:
+        return False
+    try:
+        return float(sf.info(str(path)).duration) > 0.05
+    except Exception:
+        return False
+
+
 def load_f5(args: argparse.Namespace):
     from f5_tts.api import F5TTS
 
     device = apple_device.device_str(args.device)
+    patch_f5_serial_mps(device)
     apple_device.log(f"Loading F5-TTS on device={device}")
     ckpt = args.ckpt if args.ckpt and Path(args.ckpt).is_file() else ""
     vocab = args.vocab if args.vocab and Path(args.vocab).is_file() else ""
@@ -144,7 +210,7 @@ def load_f5(args: argparse.Namespace):
         apple_device.log(f"Using fine-tuned checkpoint {ckpt}")
     if vocab:
         kwargs["vocab_file"] = vocab
-    return F5TTS(**kwargs), bool(ckpt and vocab)
+    return F5TTS(**kwargs), bool(ckpt and vocab), device
 
 
 def fit_to_slot(
@@ -287,7 +353,7 @@ def main() -> int:
 
     default_ref = Path(args.ref_out) if args.ref_out else out_path.parent / "voice_ref.wav"
     ref_audio, ref_text = resolve_reference(args, default_ref)
-    tts, using_finetune = load_f5(args)
+    tts, using_finetune, tts_device = load_f5(args)
     apple_device.log(f"Reference audio={ref_audio} text={ref_text[:80]!r}")
 
     if args.smoke_test:
@@ -299,6 +365,7 @@ def main() -> int:
             nfe_step=args.nfe_step,
             speed=1.0,
         )
+        sync_mps(tts_device)
         if wav is None:
             raise SystemExit("F5-TTS smoke test returned no audio")
         audio = np.asarray(wav, dtype=np.float32)
@@ -322,8 +389,15 @@ def main() -> int:
             text = normalize_czech(cue.content, using_finetune)
             if not text:
                 continue
-            raw = tmp_dir / f"{i:04d}_raw.wav"
             fitted = segments_dir / f"{i:04d}.wav"
+            start = cue.start.total_seconds()
+            if usable_segment(fitted):
+                samples, seg_sr = load_mono(fitted)
+                gen_sr = int(seg_sr)
+                apple_device.log(f"TTS cue {i}/{len(cues)} resume {fitted.name}")
+                pieces.append((start, samples))
+                continue
+            raw = tmp_dir / f"{i:04d}_raw.wav"
             apple_device.log(f"TTS cue {i}/{len(cues)} ({cue_seconds(cue):.2f}s): {text[:80]}")
             wav, sr, _ = tts.infer(
                 ref_file=str(ref_audio),
@@ -333,12 +407,12 @@ def main() -> int:
                 speed=1.0,
                 file_wave=str(raw),
             )
+            sync_mps(tts_device)
             if wav is None:
                 raise RuntimeError(f"F5-TTS returned no audio for cue {i}")
             gen_sr = int(sr)
             slot = max(cue_seconds(cue), 0.08)
             samples = fit_to_slot(raw, fitted, slot, args.max_speed, tmp_dir)
-            start = cue.start.total_seconds()
             pieces.append((start, samples))
 
     if not pieces:
