@@ -22,17 +22,27 @@ import device as apple_device  # noqa: E402
 apple_device.bootstrap_mps_fallback()
 
 import srt  # noqa: E402
-from srtutil import load_srt, save_srt, segments_to_cues  # noqa: E402
+from srtutil import (  # noqa: E402
+    is_rolling_captions,
+    load_srt,
+    save_srt,
+    segments_to_cues,
+)
 
 SYSTEM_PROMPT = (
     "You are a professional audiovisual translator from English to Czech. "
-    "Translate each subtitle cue into natural, spoken Czech. "
+    "Translate each English subtitle cue into natural, spoken Czech. "
     "Keep roughly the same length as the source. "
     "Do not add explanations, numbering, or timestamps. "
-    "Return ONLY a JSON array of strings, same length and order as the input array."
+    "Any previous Czech cue is context only: do not translate it and do not "
+    "include it in the output. "
+    "Return ONLY a JSON array of Czech strings with exactly the same length "
+    "and order as the input cues array."
 )
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+_LIST_KEYS = ("cues", "translations", "cs", "output", "result", "items")
+_ITEM_KEYS = ("cs", "cs_text", "translation", "text", "czech", "content")
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,16 +93,69 @@ def transcribe_mlx(audio: str, model: str) -> list[srt.Subtitle]:
     return segments_to_cues(segments)
 
 
-def parse_json_array(text: str) -> list[str]:
-    text = _FENCE_RE.sub("", (text or "").strip())
-    start = text.find("[")
-    end = text.rfind("]")
-    if start < 0 or end <= start:
-        raise ValueError("No JSON array in model output")
-    data = json.loads(text[start : end + 1])
+def _as_str_list(data: object) -> list[str]:
+    if isinstance(data, str):
+        stripped = data.strip()
+        return [stripped] if stripped else []
+    if isinstance(data, dict):
+        if "cs" in data and isinstance(data["cs"], str):
+            return [data["cs"].strip()]
+        for key in _LIST_KEYS:
+            if key in data:
+                return _as_str_list(data[key])
+        raise ValueError("JSON object has no translation list")
     if not isinstance(data, list):
         raise ValueError("JSON value is not a list")
-    return [str(item).strip() for item in data]
+    out: list[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            val = ""
+            for key in _ITEM_KEYS:
+                if key in item and item[key] is not None:
+                    val = str(item[key])
+                    break
+            if not val and item:
+                val = str(next(iter(item.values())))
+            out.append(val.strip())
+        else:
+            out.append(str(item).strip())
+    return out
+
+
+def parse_json_array(text: str) -> list[str]:
+    text = _FENCE_RE.sub("", (text or "").strip())
+    if not text:
+        raise ValueError("Empty model output")
+    try:
+        return _as_str_list(json.loads(text))
+    except json.JSONDecodeError:
+        pass
+    start = text.find("[")
+    end = text.rfind("]")
+    if start >= 0 and end > start:
+        try:
+            return _as_str_list(json.loads(text[start : end + 1]))
+        except json.JSONDecodeError:
+            pass
+    obj_start = text.find("{")
+    obj_end = text.rfind("}")
+    if obj_start >= 0 and obj_end > obj_start:
+        return _as_str_list(json.loads(text[obj_start : obj_end + 1]))
+    raise ValueError("No JSON array in model output")
+
+
+def align_translations(out: list[str], texts: list[str], prev: str) -> list[str]:
+    """Drop the extra string models emit when they also translate previous_cue."""
+    n = len(texts)
+    if len(out) == n:
+        return out
+    if len(out) == n + 1:
+        if prev:
+            return out[1:]
+        return out[:n]
+    if len(out) > n:
+        return out[:n]
+    raise ValueError(f"Ollama returned {len(out)} strings for {n} cues")
 
 
 def ollama_tags(url: str, timeout: float = 5.0) -> dict | None:
@@ -132,47 +195,95 @@ def ollama_translate_batch(
 ) -> list[str]:
     import httpx
 
+    if all(not t.strip() for t in texts):
+        return [""] * len(texts)
+
+    user_parts: list[str] = []
+    if prev.strip():
+        user_parts.append(
+            "Previous Czech cue (context only, do not translate or output it):\n"
+            + prev.strip()
+        )
+    user_parts.append(
+        "Translate this JSON array of English cues. Return a JSON array of "
+        f"exactly {len(texts)} Czech strings:"
+    )
+    user_parts.append(json.dumps(texts, ensure_ascii=False))
     payload = {
         "model": model,
         "stream": False,
         "options": {"temperature": 0},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"previous_cue": prev, "cues": texts},
-                    ensure_ascii=False,
-                ),
-            },
+            {"role": "user", "content": "\n\n".join(user_parts)},
         ],
     }
-    r = httpx.post(f"{url.rstrip('/')}/api/chat", json=payload, timeout=timeout)
-    r.raise_for_status()
-    body = r.json()
-    content = (body.get("message") or {}).get("content") or ""
-    out = parse_json_array(content)
-    if len(out) != len(texts):
-        raise ValueError(f"Ollama returned {len(out)} strings for {len(texts)} cues")
-    if any(not item for item in out):
-        raise ValueError("Ollama returned an empty cue")
-    return out
+    last_exc: Exception | None = None
+    for use_json_format in (True, False):
+        body_payload = dict(payload)
+        if use_json_format:
+            body_payload["format"] = "json"
+        try:
+            r = httpx.post(
+                f"{url.rstrip('/')}/api/chat",
+                json=body_payload,
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            body = r.json()
+            content = (body.get("message") or {}).get("content") or ""
+            raw = parse_json_array(content)
+            out = align_translations(raw, texts, prev)
+            if any(not item for item in out):
+                raise ValueError("Ollama returned an empty cue")
+            return out
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise last_exc or RuntimeError("Ollama translation failed")
 
 
 def marian_translate(texts: list[str], model: str, device: str) -> list[str]:
-    from transformers import pipeline
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     apple_device.log(f"Marian MT model={model} device={device}")
-    mt = pipeline("translation", model=model, device=device)
-    out: list[str] = []
-    batch = 16
-    for i in range(0, len(texts), batch):
-        chunk = texts[i : i + batch]
-        results = mt(chunk, max_length=256, truncation=True)
-        for item in results:
-            out.append((item.get("translation_text") or "").strip())
-    if len(out) != len(texts) or any(not t for t in out):
-        raise RuntimeError("Marian produced empty or mismatched translations")
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    mt_model = AutoModelForSeq2SeqLM.from_pretrained(model)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    torch_device = torch.device(device)
+    try:
+        mt_model.to(torch_device)
+    except Exception as exc:
+        apple_device.log(f"Marian could not use {device} ({exc}); using CPU")
+        torch_device = torch.device("cpu")
+        mt_model.to(torch_device)
+    mt_model.eval()
+
+    out: list[str] = [""] * len(texts)
+    work = [(i, t) for i, t in enumerate(texts) if t.strip()]
+    batch = 8
+    for start in range(0, len(work), batch):
+        chunk = work[start : start + batch]
+        encoded = tokenizer(
+            [t for _, t in chunk],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=256,
+        )
+        encoded = {k: v.to(torch_device) for k, v in encoded.items()}
+        with torch.inference_mode():
+            generated = mt_model.generate(**encoded, max_new_tokens=256)
+        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        if len(decoded) != len(chunk):
+            raise RuntimeError("Marian batch size mismatch")
+        for (idx, _), text in zip(chunk, decoded):
+            out[idx] = text.strip()
+    missing = [i for i, t in work if not out[i]]
+    if missing:
+        raise RuntimeError("Marian produced empty translations")
     return out
 
 
@@ -183,8 +294,8 @@ def translate_cues(
     backend = args.translation_backend
     device = apple_device.device_str(args.device)
 
-    def via_marian() -> list[str]:
-        return marian_translate(texts, args.marian_model, device)
+    def via_marian(subset: list[str] | None = None) -> list[str]:
+        return marian_translate(subset if subset is not None else texts, args.marian_model, device)
 
     if backend == "marian":
         return via_marian()
@@ -202,7 +313,7 @@ def translate_cues(
     bs = max(1, args.batch_size)
     for i in range(0, len(texts), bs):
         chunk = texts[i : i + bs]
-        prev = translated[-1] if translated else (texts[i - 1] if i else "")
+        prev = translated[-1] if translated else ""
         try:
             translated.extend(
                 ollama_translate_batch(
@@ -231,13 +342,33 @@ def translate_cues(
                         f"Ollama failed on cue {i + j + 1}; remaining cues use Marian"
                     )
                     rest = texts[len(translated) :]
-                    translated.extend(
-                        marian_translate(rest, args.marian_model, device)
-                    )
+                    translated.extend(via_marian(rest))
                     return translated
     if len(translated) != len(texts):
         raise RuntimeError("Translation count mismatch after Ollama")
     return translated
+
+
+def english_cues(args: argparse.Namespace) -> list[srt.Subtitle]:
+    if args.en_srt and Path(args.en_srt).is_file():
+        try:
+            cues = load_srt(args.en_srt)
+        except ValueError as exc:
+            apple_device.log(f"Ignoring unusable SRT {args.en_srt}: {exc}")
+            cues = None
+        else:
+            if is_rolling_captions(cues):
+                apple_device.log(
+                    f"Downloaded SRT looks like rolling auto-captions ({len(cues)} cues); "
+                    "using Whisper on vocals instead"
+                )
+                cues = None
+            else:
+                apple_device.log(f"Using downloaded English SRT ({len(cues)} cues)")
+                return cues
+    if not args.audio or not Path(args.audio).is_file():
+        raise SystemExit("Need --en-srt with cues or a readable --audio file")
+    return transcribe_mlx(args.audio, args.whisper_model)
 
 
 def main() -> int:
@@ -247,19 +378,7 @@ def main() -> int:
     out_en.parent.mkdir(parents=True, exist_ok=True)
     out_cs.parent.mkdir(parents=True, exist_ok=True)
 
-    cues: list[srt.Subtitle] | None = None
-    if args.en_srt and Path(args.en_srt).is_file():
-        try:
-            cues = load_srt(args.en_srt)
-            apple_device.log(f"Using downloaded English SRT ({len(cues)} cues)")
-        except ValueError as exc:
-            apple_device.log(f"Ignoring unusable SRT {args.en_srt}: {exc}")
-
-    if cues is None:
-        if not args.audio or not Path(args.audio).is_file():
-            raise SystemExit("Need --en-srt with cues or a readable --audio file")
-        cues = transcribe_mlx(args.audio, args.whisper_model)
-
+    cues = english_cues(args)
     save_srt(out_en, cues)
     texts = [c.content for c in cues]
     apple_device.log(f"Translating {len(texts)} cues to Czech")
