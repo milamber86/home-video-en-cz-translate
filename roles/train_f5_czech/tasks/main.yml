@@ -45,7 +45,7 @@
     - name: Editable-install F5-TTS (Vocos only, no BigVGAN)
       ansible.builtin.command:
         argv:
-          - uv
+          - "{{ brew_bin }}/uv"
           - pip
           - install
           - --python
@@ -54,6 +54,7 @@
           - "{{ f5_repo_dir }}"
       register: f5_editable
       changed_when: "'Installed' in (f5_editable.stdout | default('')) or 'Uninstalled' in (f5_editable.stdout | default(''))"
+      environment: "{{ brew_env }}"
 
     - name: Check prepared dataset metadata
       ansible.builtin.stat:
@@ -239,6 +240,8 @@
           - "{{ venv_python }}"
           - "{{ scripts_dir }}/synthesize_czech.py"
           - --smoke-test
+          - --engine
+          - f5
           - --out
           - "{{ f5_data_dir }}/smoke.wav"
           - --device
