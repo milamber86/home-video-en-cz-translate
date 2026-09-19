@@ -9,12 +9,6 @@
     state: absent
   when: force_tts | default(false) | bool
 
-- name: Clear TTS segment cache when forcing TTS
-  ansible.builtin.file:
-    path: "{{ job_dir }}/tts/segments"
-    state: absent
-  when: force_tts | default(false) | bool
-
 - name: Check existing Czech vocals
   ansible.builtin.stat:
     path: "{{ job_dir }}/tts/czech_vocals.wav"
@@ -55,11 +49,11 @@
   ansible.builtin.set_fact:
     f5_ckpt_file: "{{ (f5_ckpt_dir ~ '/model_last.safetensors') if f5_ckpt_st.stat.exists else ((f5_ckpt_dir ~ '/model_last.pt') if f5_ckpt_pt.stat.exists else '') }}"
 
-- name: Synthesize timed Czech speech (clone voice)
+- name: Synthesize timed Czech speech
   ansible.builtin.command:
-    argv: "{{ f5_clone_args + f5_ckpt_args + f5_fresh_args }}"
+    argv: "{{ tts_args + tts_ckpt_args + tts_fresh_args }}"
   vars:
-    f5_clone_args:
+    tts_args:
       - "{{ venv_python }}"
       - "{{ scripts_dir }}/synthesize_czech.py"
       - --srt
@@ -73,53 +67,13 @@
       - --engine
       - "{{ tts_engine }}"
       - --voice-mode
-      - clone
+      - "{{ voice_mode }}"
+      - --voice-gender
+      - "{{ tts_voice_gender }}"
       - --vocals
       - "{{ job_dir }}/audio/vocals.wav"
       - --ref-out
       - "{{ job_dir }}/audio/voice_ref.wav"
-      - --f5-model
-      - "{{ f5_model }}"
-      - --nfe-step
-      - "{{ f5_nfe_step | string }}"
-      - --max-speed
-      - "{{ tts_max_speed | string }}"
-      - --segments-dir
-      - "{{ job_dir }}/tts/segments"
-      - --whisper-model
-      - "{{ whisper_model }}"
-      - --piper-model
-      - "{{ piper_voice_dir }}/{{ piper_voice }}.onnx"
-      - --xtts-python
-      - "{{ xtts_python }}"
-    f5_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
-    f5_fresh_args: "{{ ['--fresh'] if (force_tts | default(false) | bool) else [] }}"
-  environment: "{{ pytorch_env }}"
-  register: f5_clone
-  failed_when: f5_clone.rc != 0
-  when:
-    - not czech_vocals.stat.exists
-    - voice_mode == 'clone'
-
-- name: Synthesize timed Czech speech (bundled voice)
-  ansible.builtin.command:
-    argv: "{{ f5_bundled_args + f5_ckpt_args + f5_fresh_args }}"
-  vars:
-    f5_bundled_args:
-      - "{{ venv_python }}"
-      - "{{ scripts_dir }}/synthesize_czech.py"
-      - --srt
-      - "{{ job_dir }}/subs/cs.srt"
-      - --out
-      - "{{ job_dir }}/tts/czech_vocals.wav"
-      - --duration
-      - "{{ video_duration.stdout | default('0') | trim }}"
-      - --device
-      - mps
-      - --engine
-      - "{{ tts_engine }}"
-      - --voice-mode
-      - bundled
       - --ref-audio
       - "{{ voice_ref_wav }}"
       - --ref-text
@@ -138,14 +92,14 @@
       - "{{ piper_voice_dir }}/{{ piper_voice }}.onnx"
       - --xtts-python
       - "{{ xtts_python }}"
-    f5_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
-    f5_fresh_args: "{{ ['--fresh'] if (force_tts | default(false) | bool) else [] }}"
+      - --vits-model
+      - "{{ tts_vits_model }}"
+    tts_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
+    tts_fresh_args: "{{ ['--fresh'] if (tts_fresh | default(false) | bool) else [] }}"
   environment: "{{ pytorch_env }}"
-  register: f5_bundled
-  failed_when: f5_bundled.rc != 0
-  when:
-    - not czech_vocals.stat.exists
-    - voice_mode == 'bundled'
+  register: tts_synth
+  failed_when: tts_synth.rc != 0
+  when: not czech_vocals.stat.exists
 
 - name: Verify Czech vocals WAV
   ansible.builtin.stat:

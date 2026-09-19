@@ -290,6 +290,20 @@
     or 'Uninstalled' in (uv_pip_xtts.stdout | default(''))
   environment: "{{ brew_env }}"
 
+- name: Verify XTTS can import PyTorch
+  ansible.builtin.command:
+    argv:
+      - "{{ xtts_python }}"
+      - -c
+      - |
+        import torch
+        import torchaudio
+        from TTS.api import TTS
+        print("xtts_torch=" + torch.__version__)
+  register: xtts_import
+  changed_when: false
+  failed_when: xtts_import.rc != 0
+
 - name: Verify ffmpeg
   ansible.builtin.command:
     argv:

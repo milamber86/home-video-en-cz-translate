@@ -2,7 +2,7 @@
 
 Ansible-orchestrated pipeline for Apple Silicon (M2 Ultra). It downloads a YouTube video, separates vocals from the bed, translates English subtitles to Czech (sentence-level), synthesizes timed Czech speech, and remuxes video + background + dubbed voice + Czech SRT.
 
-All AI libraries run in a dedicated Python venv. Ansible itself uses system Python (`connection: local`). XTTS-v2 uses a second venv (`.venv-xtts`) because Coqui pins an older `transformers` than the main pipeline.
+All AI libraries run in a dedicated Python venv. Ansible itself uses system Python (`connection: local`). Coqui TTS (female VITS, optional XTTS) uses a second venv (`.venv-xtts`) because Coqui pins an older `transformers` than the main pipeline.
 
 ## Prerequisites
 
@@ -38,8 +38,9 @@ Useful extra-vars:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `voice_mode` | `clone` | `clone` uses XTTS-v2 with a clip from original vocals; `bundled` uses Piper `cs_CZ-jirka-medium` |
-| `tts_engine` | `auto` | `auto` = Czech F5 checkpoint if present, else XTTS for clone / Piper for bundled. Never uses ZH+EN F5-base for Czech. |
+| `voice_mode` | `bundled` | Stock Czech TTS. `clone` uses original vocals only when a Czech F5 checkpoint exists; otherwise it falls back to stock. |
+| `tts_voice_gender` | `male` | `male` = Piper `cs_CZ-jirka-medium`. `female` = Coqui `tts_models/cs/cv/vits` (first run downloads ~96 MB). Ignored for F5 clone. |
+| `tts_engine` | `auto` | `auto` = Czech F5 if `voice_mode=clone` and a checkpoint exists, else Piper/VITS by gender. Never uses ZH+EN F5-base or XTTS unless you set `tts_engine` explicitly. |
 | `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist |
 | `force_tts` | `false` | Redo Czech vocals and remux |
 | `output_container` | `mkv` | `mkv` (native SRT) or `mp4` (`mov_text`) |
@@ -68,23 +69,31 @@ ansible-playbook site.yml --skip-tags setup,ollama,download,demucs \
   -e force_translate=true -e force_tts=true
 ```
 
-Output lands in `work/<youtube_id>/output/<youtube_id>.cs.mkv` (or `.mp4`).
+Female stock voice:
 
-First XTTS run downloads `xtts_v2` weights (~1.8 GB) into the Hugging Face cache.
+```bash
+ansible-playbook site.yml --skip-tags setup,ollama,download,demucs \
+  -e youtube_url='https://www.youtube.com/watch?v=VIDEO_ID' \
+  -e tts_voice_gender=female -e force_tts=true
+```
+
+Output lands in `work/<youtube_id>/output/<youtube_id>.cs.mkv` (or `.mp4`).
 
 ## Translation
 
-English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Ollama translates those sentences with the previous 1–2 English+Czech sentences as read-only context. If the API is down, JSON is malformed, or counts mismatch, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
+English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Ollama translates those sentences with the previous few English+Czech sentences as read-only context, then runs a grammar revision pass (gender/case agreement, Czech word order, no English calques). If the API is down, JSON is malformed, or counts mismatch, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
 
 ## Czech speech
 
-Official F5-TTS (`F5TTS_v1_Base`) is Chinese+English only and is **not** used for Czech inference.
+Official F5-TTS (`F5TTS_v1_Base`) is Chinese+English only and is **not** used for Czech inference. XTTS-v2 cloning is not used by default: Czech from a short English clip is not intelligible enough.
 
 | Condition | Engine |
 |---|---|
-| `models/f5_czech/model_last.safetensors` (or `.pt`) + `vocab.txt` | Fine-tuned Czech F5 |
-| `voice_mode=clone` (default) | XTTS-v2, `language=cs`, speaker from `vocals.wav` (CPU, isolated `.venv-xtts`) |
-| `voice_mode=bundled` | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
+| `voice_mode=clone` and `models/f5_czech/model_last.safetensors` (or `.pt`) + `vocab.txt` | Fine-tuned Czech F5, speaker from `vocals.wav` |
+| `tts_voice_gender=male` (default stock) | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
+| `tts_voice_gender=female` | Coqui Czech Common Voice VITS (`tts_models/cs/cv/vits`) in `.venv-xtts` |
+
+There is no official female Piper Czech voice. VITS is weaker than Jirka; a matching clone of the source speaker needs `train_czech_tts.yml`.
 
 ## Czech F5-TTS (optional, hours-long)
 
@@ -94,17 +103,25 @@ Fine-tune from `F5TTS_v1_Base` (never from scratch):
 ansible-playbook train_czech_tts.yml -K
 ```
 
-Defaults: Common Voice 17 Czech, 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.safetensors` is picked up automatically by the `f5_tts` role.
+Defaults: Common Voice 17 Czech, 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.safetensors` is picked up when `voice_mode=clone`.
 
 ```bash
 ansible-playbook train_czech_tts.yml -e f5_train_device=mps -e f5_train_force=true
+```
+
+Then:
+
+```bash
+ansible-playbook site.yml --skip-tags setup,ollama,download,demucs \
+  -e youtube_url='https://www.youtube.com/watch?v=VIDEO_ID' \
+  -e voice_mode=clone -e force_tts=true
 ```
 
 ## Device policy
 
 - `PYTORCH_ENABLE_MPS_FALLBACK=1` is set before any `import torch`.
 - Demucs, Marian, and Czech F5 inference use `torch.device("mps")` when available.
-- XTTS-v2 runs on CPU in `.venv-xtts`.
+- Coqui VITS (and unused XTTS) run on CPU in `.venv-xtts`.
 - Whisper uses **mlx-whisper** on Metal (`mlx-community/whisper-large-v3-mlx`). `openai-whisper` + MPS is unreliable; `faster-whisper` is CPU-only on Mac.
 
 ## Layout
@@ -116,5 +133,5 @@ files/voices/   Optional bundled F5 reference WAV + transcript (only if a Czech 
 work/<id>/      Per-video artifacts
 models/piper/   Piper cs_CZ-jirka-medium (gitignored)
 models/f5_czech/  Trained Czech F5 checkpoint (gitignored)
-.venv-xtts/     Isolated Coqui / XTTS-v2 env (gitignored)
+.venv-xtts/     Isolated Coqui env for VITS (gitignored)
 ```

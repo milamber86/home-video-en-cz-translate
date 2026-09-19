@@ -28,17 +28,38 @@ from srtutil import (  # noqa: E402
     segments_to_cues,
 )
 
+CONTEXT_SENTENCES = 4
+
 SYSTEM_PROMPT = (
     "You are a professional audiovisual translator from English to Czech. "
     "Translate each English subtitle sentence into natural, spoken Czech. "
     "The items are consecutive sentences from the same talk, not isolated fragments. "
     "Preserve clause links and finish each thought; do not restart meaning at "
     "array boundaries. Keep roughly the same length as the source. "
+    "Use correct Czech gender, number, and case agreement, and Czech word order. "
+    "Do not calque English syntax or stack tautologies "
+    "(bad: 'této názoru' → good: 'tohoto názoru'; "
+    "bad: 'současnou ekonomickou systémem' → good: 'současným ekonomickým systémem'; "
+    "bad: 'by měla stát přednost vytváření a udržování institucí nezbytných pro "
+    "funkční fungování trhů' → good: 'by stát měl dávat přednost vytváření a "
+    "udržování institucí nezbytných pro fungování trhů'). "
     "Do not add explanations, numbering, or timestamps. "
     "Previous sentences given as context are read-only: do not translate or "
     "repeat them in the output. "
     "Return ONLY a JSON array of Czech strings with exactly the same length "
     "and order as the input sentences array."
+)
+
+REVISE_PROMPT = (
+    "You are a native Czech subtitle editor. Revise each Czech draft so it is "
+    "grammatical spoken Czech. Fix gender, number, and case agreement. Use Czech "
+    "word order, not English calques. Do not change meaning or add content. "
+    "Keep roughly the same length. Examples: 'této názoru' → 'tohoto názoru'; "
+    "'současnou ekonomickou systémem' → 'současným ekonomickým systémem'; "
+    "'by měla stát přednost … funkční fungování trhů' → "
+    "'by stát měl dávat přednost … fungování trhů'. "
+    "Return ONLY a JSON array of Czech strings with exactly the same length "
+    "and order as the input drafts."
 )
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
@@ -187,43 +208,27 @@ def pick_ollama_model(tags: dict, preferred: str) -> str:
     raise RuntimeError("Ollama is running but has no models")
 
 
-def ollama_translate_batch(
+def ollama_chat(
     url: str,
     model: str,
+    system: str,
+    user: str,
     texts: list[str],
-    context: list[tuple[str, str]],
     timeout: float,
+    prev_blob: str = "",
 ) -> list[str]:
     import httpx
 
-    if all(not t.strip() for t in texts):
-        return [""] * len(texts)
-
-    user_parts: list[str] = []
-    if context:
-        user_parts.append(
-            "Previous sentences (read-only context, do not translate or output):\n"
-            + json.dumps(
-                [{"en": en, "cs": cs} for en, cs in context],
-                ensure_ascii=False,
-            )
-        )
-    user_parts.append(
-        "Translate this JSON array of English sentences. Return a JSON array of "
-        f"exactly {len(texts)} Czech strings:"
-    )
-    user_parts.append(json.dumps(texts, ensure_ascii=False))
     payload = {
         "model": model,
         "stream": False,
         "options": {"temperature": 0},
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "\n\n".join(user_parts)},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
     }
     last_exc: Exception | None = None
-    prev_blob = " ".join(cs for _, cs in context)
     for use_json_format in (True, False):
         body_payload = dict(payload)
         if use_json_format:
@@ -245,7 +250,77 @@ def ollama_translate_batch(
         except Exception as exc:
             last_exc = exc
             continue
-    raise last_exc or RuntimeError("Ollama translation failed")
+    raise last_exc or RuntimeError("Ollama chat failed")
+
+
+def ollama_translate_batch(
+    url: str,
+    model: str,
+    texts: list[str],
+    context: list[tuple[str, str]],
+    timeout: float,
+) -> list[str]:
+    if all(not t.strip() for t in texts):
+        return [""] * len(texts)
+
+    user_parts: list[str] = []
+    if context:
+        user_parts.append(
+            "Previous sentences (read-only context, do not translate or output):\n"
+            + json.dumps(
+                [{"en": en, "cs": cs} for en, cs in context],
+                ensure_ascii=False,
+            )
+        )
+    user_parts.append(
+        "Translate this JSON array of English sentences. Return a JSON array of "
+        f"exactly {len(texts)} Czech strings:"
+    )
+    user_parts.append(json.dumps(texts, ensure_ascii=False))
+    prev_blob = " ".join(cs for _, cs in context)
+    return ollama_chat(
+        url,
+        model,
+        SYSTEM_PROMPT,
+        "\n\n".join(user_parts),
+        texts,
+        timeout,
+        prev_blob=prev_blob,
+    )
+
+
+def ollama_revise_batch(
+    url: str,
+    model: str,
+    english: list[str],
+    drafts: list[str],
+    timeout: float,
+) -> list[str]:
+    if all(not t.strip() for t in drafts):
+        return list(drafts)
+    pairs = [{"en": en, "cs": cs} for en, cs in zip(english, drafts)]
+    user = (
+        "Revise the Czech drafts. Each object has the English source (en) and "
+        f"the Czech draft (cs). Return a JSON array of exactly {len(drafts)} "
+        "revised Czech strings in the same order:\n"
+        + json.dumps(pairs, ensure_ascii=False)
+    )
+    return ollama_chat(url, model, REVISE_PROMPT, user, drafts, timeout)
+
+
+def ollama_translate_and_revise(
+    url: str,
+    model: str,
+    texts: list[str],
+    context: list[tuple[str, str]],
+    timeout: float,
+) -> list[str]:
+    draft = ollama_translate_batch(url, model, texts, context, timeout)
+    try:
+        return ollama_revise_batch(url, model, texts, draft, timeout)
+    except Exception as exc:
+        apple_device.log(f"Ollama revise skipped ({exc}); keeping draft")
+        return draft
 
 
 def marian_translate(texts: list[str], model: str, device: str) -> list[str]:
@@ -313,28 +388,29 @@ def translate_cues(
         return via_marian()
 
     model = pick_ollama_model(tags, args.ollama_model)
-    apple_device.log(f"Translating with Ollama model={model}")
+    apple_device.log(f"Translating with Ollama model={model} (grammar revise pass)")
     translated: list[str] = []
     bs = max(1, args.batch_size)
+    ctx_n = CONTEXT_SENTENCES
     for i in range(0, len(texts), bs):
         chunk = texts[i : i + bs]
-        ctx_en = texts[max(0, i - 2) : i]
+        ctx_en = texts[max(0, i - ctx_n) : i]
         ctx = list(zip(ctx_en, translated[-len(ctx_en) :] if ctx_en else []))
         try:
             translated.extend(
-                ollama_translate_batch(
+                ollama_translate_and_revise(
                     args.ollama_url, model, chunk, ctx, args.ollama_timeout
                 )
             )
         except Exception as exc:
             apple_device.log(f"Ollama batch failed ({exc}); retrying per sentence")
             for j, cue_text in enumerate(chunk):
-                one_en = texts[max(0, i + j - 2) : i + j]
+                one_en = texts[max(0, i + j - ctx_n) : i + j]
                 one_ctx = list(
                     zip(one_en, translated[-len(one_en) :] if one_en else [])
                 )
                 try:
-                    one = ollama_translate_batch(
+                    one = ollama_translate_and_revise(
                         args.ollama_url,
                         model,
                         [cue_text],

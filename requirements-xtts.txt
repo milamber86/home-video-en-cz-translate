@@ -1,2 +1,5 @@
 # Isolated Coqui TTS / XTTS-v2 env. Do not install into the main pipeline venv.
-coqui-tts>=0.27.0
+# [cpu] pulls torch+torchaudio; [codec] is required for PyTorch 2.9+ audio IO.
+# transformers 5.x dropped isin_mps_friendly, which XTTS still imports.
+coqui-tts[cpu,codec]>=0.27.0
+transformers>=4.57,<5

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate timed Czech speech from an SRT (Piper, XTTS-v2, or Czech F5)."""
+"""Generate timed Czech speech from an SRT (Piper, Coqui VITS, or Czech F5)."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ import soundfile as sf  # noqa: E402
 from srtutil import cue_seconds, load_srt  # noqa: E402
 
 BASE_GRAPHEME_FIX = str.maketrans({"ů": "ú", "Ů": "Ú", "ď": "d", "Ď": "D"})
+VITS_MODEL = "tts_models/cs/cv/vits"
+XTTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,8 +36,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output czech_vocals.wav")
     p.add_argument("--duration", type=float, help="Video duration seconds (required unless --smoke-test)")
     p.add_argument("--device", default="mps")
-    p.add_argument("--engine", default="auto", choices=("auto", "f5", "xtts", "piper"))
-    p.add_argument("--voice-mode", choices=("clone", "bundled"), default="clone")
+    p.add_argument("--engine", default="auto", choices=("auto", "f5", "xtts", "piper", "vits"))
+    p.add_argument("--voice-mode", choices=("clone", "bundled"), default="bundled")
+    p.add_argument("--voice-gender", choices=("male", "female"), default="male")
     p.add_argument("--vocals", help="Original vocals.wav for clone mode")
     p.add_argument("--ref-audio", help="Bundled or explicit reference WAV")
     p.add_argument("--ref-out", help="Where to write the extracted clone reference WAV")
@@ -49,7 +52,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--whisper-model", default="mlx-community/whisper-large-v3-mlx")
     p.add_argument("--sample-rate", type=int, default=48000)
     p.add_argument("--piper-model", default="", help="Piper ONNX voice (cs_CZ-jirka-medium.onnx)")
-    p.add_argument("--xtts-python", default="", help="Interpreter for isolated .venv-xtts")
+    p.add_argument("--xtts-python", default="", help="Interpreter for isolated .venv-xtts (VITS/XTTS)")
+    p.add_argument("--vits-model", default=VITS_MODEL, help="Coqui Czech VITS model name")
     p.add_argument("--fresh", action="store_true", help="Ignore existing per-cue WAVs")
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--smoke-text", default="Za svítání šel dům přes louku.")
@@ -138,20 +142,41 @@ def czech_f5_ready(args: argparse.Namespace) -> bool:
     )
 
 
+def stock_engine(gender: str) -> str:
+    return "vits" if gender == "female" else "piper"
+
+
 def select_engine(args: argparse.Namespace) -> str:
+    gender = (args.voice_gender or "male").strip().lower()
+    if gender not in ("male", "female"):
+        raise SystemExit(f"Unsupported --voice-gender {args.voice_gender}")
     requested = (args.engine or "auto").strip().lower()
     if requested == "auto":
-        if czech_f5_ready(args):
-            return "f5"
         if args.voice_mode == "clone":
-            return "xtts"
-        return "piper"
+            if czech_f5_ready(args):
+                return "f5"
+            apple_device.log(
+                "voice_mode=clone needs a Czech F5 checkpoint from "
+                "train_czech_tts.yml; falling back to a stock "
+                f"{gender} voice"
+            )
+            return stock_engine(gender)
+        return stock_engine(gender)
     if requested == "f5" and not czech_f5_ready(args):
         raise SystemExit(
             "engine=f5 requires a Czech fine-tune (--ckpt and --vocab). "
             "Official F5TTS_v1_Base is ZH+EN and is not used for Czech."
         )
     return requested
+
+
+def voice_cache_id(engine: str) -> str:
+    return {
+        "piper": "piper_jirka",
+        "vits": "vits_cv",
+        "f5": "f5_clone",
+        "xtts": "xtts_clone",
+    }.get(engine, engine)
 
 
 def normalize_czech(text: str, engine: str, using_finetune: bool) -> str:
@@ -286,39 +311,40 @@ def piper_to_wav(text: str, model: Path, dest: Path) -> None:
             wf.writeframes(audio_bytes)
 
 
-def xtts_batch(xtts_python: Path, speaker: Path, jobs: list[dict]) -> None:
-    if not xtts_python.is_file():
+def coqui_batch(
+    coqui_python: Path,
+    jobs: list[dict],
+    model: str,
+    speaker: Path | None = None,
+) -> None:
+    if not coqui_python.is_file():
         raise SystemExit(
-            f"XTTS interpreter missing: {xtts_python}. "
+            f"Coqui interpreter missing: {coqui_python}. "
             "Re-run the setup role to create .venv-xtts."
         )
     if not jobs:
         return
     with tempfile.NamedTemporaryFile(
-        prefix="xtts_jobs_", suffix=".json", delete=False, mode="w", encoding="utf-8"
+        prefix="coqui_jobs_", suffix=".json", delete=False, mode="w", encoding="utf-8"
     ) as fh:
         json.dump(jobs, fh, ensure_ascii=False)
         jobs_path = Path(fh.name)
     try:
-        proc = subprocess.run(
-            [
-                str(xtts_python),
-                str(SCRIPTS_DIR / "xtts_synth.py"),
-                "--speaker",
-                str(speaker),
-                "--language",
-                "cs",
-                "--jobs",
-                str(jobs_path),
-            ],
-            capture_output=True,
-            text=True,
-        )
+        cmd = [
+            str(coqui_python),
+            str(SCRIPTS_DIR / "xtts_synth.py"),
+            "--model",
+            model,
+            "--language",
+            "cs",
+            "--jobs",
+            str(jobs_path),
+        ]
+        if speaker is not None:
+            cmd.extend(["--speaker", str(speaker)])
+        proc = subprocess.run(cmd)
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"xtts_synth.py failed ({proc.returncode})\n"
-                f"{proc.stderr}\n{proc.stdout}"
-            )
+            raise RuntimeError(f"xtts_synth.py failed ({proc.returncode})")
     finally:
         jobs_path.unlink(missing_ok=True)
 
@@ -422,7 +448,7 @@ def overlay(pieces: list[tuple[float, np.ndarray]], duration: float, sr: int) ->
 
 
 def resolve_speaker(args: argparse.Namespace, job_ref: Path, engine: str) -> tuple[Path | None, str]:
-    if engine == "piper":
+    if engine in ("piper", "vits"):
         return None, ""
     if args.voice_mode == "bundled":
         if not args.ref_audio or not Path(args.ref_audio).is_file():
@@ -477,7 +503,11 @@ def main() -> int:
     if not args.smoke_test and (not args.srt or args.duration is None):
         raise SystemExit("--srt and --duration are required unless --smoke-test")
     engine = select_engine(args)
-    apple_device.log(f"TTS engine={engine} voice_mode={args.voice_mode}")
+    cache_id = voice_cache_id(engine)
+    apple_device.log(
+        f"TTS engine={engine} voice_mode={args.voice_mode} "
+        f"gender={args.voice_gender} cache={cache_id}"
+    )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,6 +528,8 @@ def main() -> int:
         if speaker is None:
             raise SystemExit("XTTS clone requires a speaker WAV")
         apple_device.log(f"XTTS speaker={speaker}")
+    elif engine == "vits":
+        apple_device.log(f"Coqui VITS model={args.vits_model}")
     else:
         model = Path(args.piper_model) if args.piper_model else Path()
         if not model.is_file():
@@ -513,12 +545,14 @@ def main() -> int:
             raw = Path(tmp) / "smoke.wav"
             if engine == "f5":
                 f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
-            elif engine == "xtts":
-                xtts_python = Path(args.xtts_python) if args.xtts_python else Path()
-                xtts_batch(
-                    xtts_python,
-                    speaker,
+            elif engine in ("xtts", "vits"):
+                coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
+                model = XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+                coqui_batch(
+                    coqui_python,
                     [{"text": text, "out": str(raw)}],
+                    model,
+                    speaker if engine == "xtts" else None,
                 )
             else:
                 piper_to_wav(text, Path(args.piper_model), raw)
@@ -534,7 +568,7 @@ def main() -> int:
     cues = load_srt(args.srt, sentences=False)
     pieces: list[tuple[float, np.ndarray]] = []
     gen_sr = 24000
-    pending_xtts: list[dict] = []
+    pending_coqui: list[dict] = []
     pending_meta: list[tuple[int, Path, Path, float, float]] = []
 
     with tempfile.TemporaryDirectory(prefix="ttscue_") as tmp:
@@ -543,7 +577,7 @@ def main() -> int:
             text = normalize_czech(cue.content, engine, using_finetune)
             if not text:
                 continue
-            fitted = segments_dir / f"{i:04d}.wav"
+            fitted = segments_dir / f"{i:04d}.{cache_id}.wav"
             start = cue.start.total_seconds()
             slot = max(cue_seconds(cue), 0.08)
             if not args.fresh and usable_segment(fitted):
@@ -552,10 +586,13 @@ def main() -> int:
                 apple_device.log(f"TTS cue {i}/{len(cues)} resume {fitted.name}")
                 pieces.append((start, samples))
                 continue
-            raw = tmp_dir / f"{i:04d}_raw.wav"
+            raw = segments_dir / f"{i:04d}.{cache_id}_raw.wav"
             apple_device.log(f"TTS cue {i}/{len(cues)} ({slot:.2f}s): {text[:80]}")
-            if engine == "xtts":
-                pending_xtts.append({"text": text, "out": str(raw)})
+            if engine in ("xtts", "vits"):
+                if usable_segment(raw):
+                    apple_device.log(f"TTS cue {i}/{len(cues)} reuse {raw.name}")
+                else:
+                    pending_coqui.append({"text": text, "out": str(raw)})
                 pending_meta.append((i, raw, fitted, start, slot))
                 continue
             if engine == "f5":
@@ -566,15 +603,21 @@ def main() -> int:
             gen_sr = int(sf.info(str(fitted)).samplerate)
             pieces.append((start, samples))
 
-        if pending_xtts:
-            xtts_python = Path(args.xtts_python) if args.xtts_python else Path()
-            xtts_batch(xtts_python, speaker, pending_xtts)
-            for _i, raw, fitted, start, slot in pending_meta:
-                if not raw.is_file():
-                    raise RuntimeError(f"XTTS did not write {raw}")
-                samples = fit_to_slot(raw, fitted, slot, args.max_speed, tmp_dir)
-                gen_sr = int(sf.info(str(fitted)).samplerate)
-                pieces.append((start, samples))
+        if pending_coqui:
+            coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
+            model = XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+            coqui_batch(
+                coqui_python,
+                pending_coqui,
+                model,
+                speaker if engine == "xtts" else None,
+            )
+        for _i, raw, fitted, start, slot in pending_meta:
+            if not raw.is_file():
+                raise RuntimeError(f"Coqui TTS did not write {raw}")
+            samples = fit_to_slot(raw, fitted, slot, args.max_speed, tmp_dir)
+            gen_sr = int(sf.info(str(fitted)).samplerate)
+            pieces.append((start, samples))
 
     if not pieces:
         raise SystemExit("No Czech speech segments were generated")
