@@ -81,6 +81,7 @@ f5_train_max_seconds: 12.0
 f5_train_dataset_name: czech
 f5_train_text_column: raw_text
 f5_train_audio_column: audio
+f5_train_prep_workers: 8
 f5_train_smoke_text: "Za svítání šel dům přes louku."
 
 pytorch_env:

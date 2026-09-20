@@ -56,14 +56,9 @@
       changed_when: "'Installed' in (f5_editable.stdout | default('')) or 'Uninstalled' in (f5_editable.stdout | default(''))"
       environment: "{{ brew_env }}"
 
-    - name: Check prepared dataset metadata
-      ansible.builtin.stat:
-        path: "{{ f5_data_dir }}/raw/metadata.csv"
-      register: raw_meta
-
     - name: Download and prepare Czech speech clips
       ansible.builtin.command:
-        argv: "{{ prepare_base + prepare_local }}"
+        argv: "{{ prepare_base + prepare_local + prepare_fresh }}"
       vars:
         prepare_base:
           - "{{ venv_python }}"
@@ -86,11 +81,15 @@
           - "{{ f5_train_min_seconds | string }}"
           - --max-seconds
           - "{{ f5_train_max_seconds | string }}"
+          - --workers
+          - "{{ f5_train_prep_workers | default(8) | string }}"
         prepare_local: "{{ ['--local-dir', f5_train_local_dir] if f5_train_local_dir | length > 0 else [] }}"
+        prepare_fresh: "{{ ['--fresh'] if (f5_train_force | bool) else [] }}"
       environment: "{{ pytorch_env }}"
       register: prepare_data
       failed_when: prepare_data.rc != 0
-      when: not raw_meta.stat.exists or (f5_train_force | bool)
+      async: 86400
+      poll: 15
 
     - name: Extend F5 vocab and text embeddings for Czech
       ansible.builtin.command:
@@ -141,12 +140,23 @@
           - "{{ f5_data_dir }}/prepared/."
           - "{{ f5_repo_dir }}/data/{{ f5_train_dataset_name }}_custom/"
 
+    - name: Stat in-progress F5 training checkpoint
+      ansible.builtin.stat:
+        path: "{{ f5_repo_dir }}/ckpts/{{ f5_train_dataset_name }}/model_last.pt"
+      register: f5_train_last
+
+    - name: Resume from last training checkpoint
+      ansible.builtin.debug:
+        msg: >-
+          F5-TTS will resume from {{ f5_train_last.stat.path }}
+          ({{ (f5_train_last.stat.size / 1073741824) | round(1) }} GiB).
+      when: f5_train_last.stat.exists
+
     - name: Fine-tune F5TTS_v1_Base on Czech
       ansible.builtin.command:
         argv:
           - "{{ venv_python }}"
-          - -m
-          - f5_tts.train.finetune_cli
+          - "{{ scripts_dir }}/finetune_czech_f5.py"
           - --exp_name
           - F5TTS_v1_Base
           - --dataset_name
@@ -177,7 +187,7 @@
           - --last_per_updates
           - "500"
           - --log_samples
-      environment: "{{ pytorch_env | combine({'WANDB_MODE': 'disabled', 'ACCELERATE_USE_CPU': 'true' if f5_train_device == 'cpu' else 'false'}) }}"
+      environment: "{{ pytorch_env | combine({'WANDB_MODE': 'disabled', 'ACCELERATE_USE_CPU': 'true' if f5_train_device == 'cpu' else 'false', 'F5_TRAIN_DEVICE': f5_train_device}) }}"
       register: f5_train
       failed_when: f5_train.rc != 0
       async: 86400
