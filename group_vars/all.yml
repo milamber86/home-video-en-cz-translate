@@ -82,6 +82,9 @@ f5_train_dataset_name: czech
 f5_train_text_column: raw_text
 f5_train_audio_column: audio
 f5_train_prep_workers: 8
+# In-process loading. F5's default 16 persistent workers hit EMFILE on epoch 2.
+f5_train_num_workers: 0
+f5_train_last_per_updates: 100
 f5_train_smoke_text: "Za svítání šel dům přes louku."
 
 pytorch_env:
