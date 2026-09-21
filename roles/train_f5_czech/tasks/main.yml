@@ -189,8 +189,8 @@
           - --log_samples
       environment: "{{ pytorch_env | combine({'WANDB_MODE': 'disabled', 'ACCELERATE_USE_CPU': 'true' if f5_train_device == 'cpu' else 'false', 'F5_TRAIN_DEVICE': f5_train_device, 'F5_TRAIN_NUM_WORKERS': f5_train_num_workers | default(0) | string}) }}"
       register: f5_train
-      failed_when: f5_train.rc != 0
-      async: 86400
+      failed_when: (f5_train.rc | default(1)) != 0
+      async: "{{ f5_train_async_seconds | int }}"
       poll: 30
 
     - name: Find trained checkpoints

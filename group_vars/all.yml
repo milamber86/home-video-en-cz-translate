@@ -85,6 +85,8 @@ f5_train_prep_workers: 8
 # In-process loading. F5's default 16 persistent workers hit EMFILE on epoch 2.
 f5_train_num_workers: 0
 f5_train_last_per_updates: 100
+# 10 CPU epochs is ~40h at ~9s/update; Ansible kills the job when this elapses.
+f5_train_async_seconds: 259200
 f5_train_smoke_text: "Za svítání šel dům přes louku."
 
 pytorch_env:
