@@ -49,6 +49,17 @@
   ansible.builtin.set_fact:
     f5_ckpt_file: "{{ (f5_ckpt_dir ~ '/model_last.safetensors') if f5_ckpt_st.stat.exists else ((f5_ckpt_dir ~ '/model_last.pt') if f5_ckpt_pt.stat.exists else '') }}"
 
+- name: Announce TTS checkpoint
+  ansible.builtin.debug:
+    msg: >-
+      {% if f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists %}
+      Czech F5 checkpoint {{ f5_ckpt_file }} (tts_engine={{ tts_engine }},
+      voice_mode={{ voice_mode }}). auto uses this for clone-from-vocals.
+      {% else %}
+      No Czech F5 checkpoint in {{ f5_ckpt_dir }}; stock
+      {{ tts_voice_gender }} TTS (Piper/VITS).
+      {% endif %}
+
 - name: Synthesize timed Czech speech
   ansible.builtin.command:
     argv: "{{ tts_args + tts_ckpt_args + tts_fresh_args }}"

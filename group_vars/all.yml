@@ -52,8 +52,8 @@ xtts_venv: "{{ playbook_dir }}/.venv-xtts"
 xtts_python: "{{ xtts_venv }}/bin/python"
 tts_vits_model: tts_models/cs/cv/vits
 
-# Voice / TTS. Clone is optional and only used when a Czech F5 checkpoint exists.
-voice_mode: bundled
+# Voice / TTS. auto uses Czech F5 + vocals.wav when models/f5_czech exists.
+voice_mode: clone
 tts_voice_gender: male
 voice_ref_wav: "{{ playbook_dir }}/files/voices/czech_default_ref.wav"
 voice_ref_text: "{{ playbook_dir }}/files/voices/czech_default_ref.txt"

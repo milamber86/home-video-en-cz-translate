@@ -146,21 +146,25 @@ def stock_engine(gender: str) -> str:
     return "vits" if gender == "female" else "piper"
 
 
+def _path_ready(value: str | None) -> bool:
+    return bool(value and Path(value).is_file())
+
+
 def select_engine(args: argparse.Namespace) -> str:
     gender = (args.voice_gender or "male").strip().lower()
     if gender not in ("male", "female"):
         raise SystemExit(f"Unsupported --voice-gender {args.voice_gender}")
     requested = (args.engine or "auto").strip().lower()
     if requested == "auto":
+        if czech_f5_ready(args):
+            apple_device.log(f"TTS auto: Czech F5 checkpoint {args.ckpt}")
+            return "f5"
         if args.voice_mode == "clone":
-            if czech_f5_ready(args):
-                return "f5"
             apple_device.log(
                 "voice_mode=clone needs a Czech F5 checkpoint from "
                 "train_czech_tts.yml; falling back to a stock "
                 f"{gender} voice"
             )
-            return stock_engine(gender)
         return stock_engine(gender)
     if requested == "f5" and not czech_f5_ready(args):
         raise SystemExit(
@@ -168,6 +172,23 @@ def select_engine(args: argparse.Namespace) -> str:
             "Official F5TTS_v1_Base is ZH+EN and is not used for Czech."
         )
     return requested
+
+
+def resolve_voice_mode(args: argparse.Namespace, engine: str) -> str:
+    """Use vocals.wav for F5 when the bundled reference WAV is absent."""
+    mode = (args.voice_mode or "bundled").strip().lower()
+    if engine != "f5":
+        return mode
+    if mode == "clone":
+        return mode
+    if _path_ready(args.ref_audio):
+        return "bundled"
+    if _path_ready(args.vocals):
+        apple_device.log(
+            "voice_mode=bundled has no reference WAV; cloning from vocals.wav"
+        )
+        return "clone"
+    return mode
 
 
 def voice_cache_id(engine: str) -> str:
@@ -503,6 +524,7 @@ def main() -> int:
     if not args.smoke_test and (not args.srt or args.duration is None):
         raise SystemExit("--srt and --duration are required unless --smoke-test")
     engine = select_engine(args)
+    args.voice_mode = resolve_voice_mode(args, engine)
     cache_id = voice_cache_id(engine)
     apple_device.log(
         f"TTS engine={engine} voice_mode={args.voice_mode} "

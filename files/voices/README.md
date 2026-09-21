@@ -1,8 +1,9 @@
 # Bundled Czech F5 voice reference
 
 These files are used only when you explicitly run Czech F5 with `voice_mode=bundled`
-and a checkpoint exists under `models/f5_czech/`. Stock TTS (`voice_mode=bundled`,
-the default) uses Piper (male) or Coqui VITS (female) and ignores this directory.
+and a checkpoint exists under `models/f5_czech/`. The default is `voice_mode=clone`:
+`tts_engine=auto` uses the Czech F5 checkpoint plus a clip from `vocals.wav`.
+Without a checkpoint, the pipeline falls back to Piper (male) or Coqui VITS (female).
 
 When a Czech F5 checkpoint is present and you want F5 without cloning the source
 video, place two files here:

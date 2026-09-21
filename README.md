@@ -38,9 +38,9 @@ Useful extra-vars:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `voice_mode` | `bundled` | Stock Czech TTS. `clone` uses original vocals only when a Czech F5 checkpoint exists; otherwise it falls back to stock. |
+| `voice_mode` | `clone` | Clone the source speaker via Czech F5 when `models/f5_czech` exists. Without a checkpoint, falls back to stock Piper/VITS. `bundled` keeps stock TTS (or bundled F5 if you add `files/voices/czech_default_ref.wav`). |
 | `tts_voice_gender` | `male` | `male` = Piper `cs_CZ-jirka-medium`. `female` = Coqui `tts_models/cs/cv/vits` (first run downloads ~96 MB). Ignored for F5 clone. |
-| `tts_engine` | `auto` | `auto` = Czech F5 if `voice_mode=clone` and a checkpoint exists, else Piper/VITS by gender. Never uses ZH+EN F5-base or XTTS unless you set `tts_engine` explicitly. |
+| `tts_engine` | `auto` | `auto` = Czech F5 if `models/f5_czech/model_last.{safetensors,pt}` + `vocab.txt` exist, else Piper/VITS by gender. Never uses ZH+EN F5-base or XTTS unless you set `tts_engine` explicitly. |
 | `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist |
 | `force_tts` | `false` | Redo Czech vocals and remux |
 | `output_container` | `mkv` | `mkv` (native SRT) or `mp4` (`mov_text`) |
@@ -89,8 +89,8 @@ Official F5-TTS (`F5TTS_v1_Base`) is Chinese+English only and is **not** used fo
 
 | Condition | Engine |
 |---|---|
-| `voice_mode=clone` and `models/f5_czech/model_last.safetensors` (or `.pt`) + `vocab.txt` | Fine-tuned Czech F5, speaker from `vocals.wav` |
-| `tts_voice_gender=male` (default stock) | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
+| Czech F5 checkpoint in `models/f5_czech` (`model_last.pt` or `.safetensors` + `vocab.txt`) | Fine-tuned Czech F5, speaker from `vocals.wav` (`tts_engine=auto`) |
+| No Czech F5 checkpoint, `tts_voice_gender=male` | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
 | `tts_voice_gender=female` | Coqui Czech Common Voice VITS (`tts_models/cs/cv/vits`) in `.venv-xtts` |
 
 There is no official female Piper Czech voice. VITS is weaker than Jirka; a matching clone of the source speaker needs `train_czech_tts.yml`.
@@ -103,7 +103,7 @@ Fine-tune from `F5TTS_v1_Base` (never from scratch):
 ansible-playbook train_czech_tts.yml -K
 ```
 
-Defaults: VoxPopuli Czech (`facebook/voxpopuli`, config `cs`; ~62 transcribed hours), 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.safetensors` is picked up when `voice_mode=clone`.
+Defaults: VoxPopuli Czech (`facebook/voxpopuli`, config `cs`; ~62 transcribed hours), 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.pt` (or `.safetensors`) is used automatically by `tts_engine=auto`.
 
 Mozilla Common Voice is no longer hosted on Hugging Face (Mozilla Data Collective as of October 2025). To train on a CV tarball you downloaded yourself, unpack it to `metadata.csv` + `wavs/` and pass `-e f5_train_local_dir=/path/to/that/dir`.
 
@@ -116,7 +116,7 @@ Then:
 ```bash
 ansible-playbook site.yml --skip-tags setup,ollama,download,demucs \
   -e youtube_url='https://www.youtube.com/watch?v=VIDEO_ID' \
-  -e voice_mode=clone -e force_tts=true
+  -e force_tts=true
 ```
 
 ## Device policy
