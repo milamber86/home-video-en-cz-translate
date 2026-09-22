@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default="tts_models/multilingual/multi-dataset/xtts_v2",
     )
+    p.add_argument(
+        "--prefetch",
+        action="store_true",
+        help="Download pretrained XTTS-v2 weights (includes Czech) and exit",
+    )
     return p.parse_args()
 
 
@@ -188,6 +193,10 @@ def usable(path: Path) -> bool:
 
 def main() -> int:
     args = parse_args()
+    if args.prefetch:
+        load_tts(args.model)
+        print("XTTS pretrained weights ready", file=sys.stderr, flush=True)
+        return 0
     xtts = is_xtts_model(args.model)
     speaker = Path(args.speaker) if args.speaker else None
     if xtts:

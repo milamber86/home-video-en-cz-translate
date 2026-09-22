@@ -5,8 +5,11 @@
 
 - name: Remove previous Czech vocals when forcing TTS
   ansible.builtin.file:
-    path: "{{ job_dir }}/tts/czech_vocals.wav"
+    path: "{{ item }}"
     state: absent
+  loop:
+    - "{{ job_dir }}/tts/czech_vocals.wav"
+    - "{{ job_dir }}/tts/segments"
   when: force_tts | default(false) | bool
 
 - name: Check existing Czech vocals
@@ -52,17 +55,15 @@
 - name: Announce TTS checkpoint
   ansible.builtin.debug:
     msg: >-
+      TTS engine={{ tts_engine }} voice_mode={{ voice_mode }}.
+      auto uses pretrained XTTS-v2 (Czech) when the Coqui weights are cached.
       {% if f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists %}
-      Czech F5 checkpoint {{ f5_ckpt_file }} (tts_engine={{ tts_engine }},
-      voice_mode={{ voice_mode }}). auto uses this for clone-from-vocals.
-      {% else %}
-      No Czech F5 checkpoint in {{ f5_ckpt_dir }}; stock
-      {{ tts_voice_gender }} TTS (Piper/VITS).
+      Czech F5 checkpoint {{ f5_ckpt_file }} is used only if tts_engine=f5.
       {% endif %}
 
 - name: Synthesize timed Czech speech
   ansible.builtin.command:
-    argv: "{{ tts_args + tts_ckpt_args + tts_fresh_args }}"
+    argv: "{{ tts_args + tts_ckpt_args + tts_fresh_args + tts_bundled_ref_args }}"
   vars:
     tts_args:
       - "{{ venv_python }}"
@@ -85,10 +86,6 @@
       - "{{ job_dir }}/audio/vocals.wav"
       - --ref-out
       - "{{ job_dir }}/audio/voice_ref.wav"
-      - --ref-audio
-      - "{{ voice_ref_wav }}"
-      - --ref-text
-      - "{{ voice_ref_text }}"
       - --f5-model
       - "{{ f5_model }}"
       - --nfe-step
@@ -107,6 +104,7 @@
       - "{{ tts_vits_model }}"
     tts_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
     tts_fresh_args: "{{ ['--fresh'] if (tts_fresh | default(false) | bool) else [] }}"
+    tts_bundled_ref_args: "{{ ['--ref-audio', voice_ref_wav, '--ref-text', voice_ref_text] if voice_mode == 'bundled' else [] }}"
   environment: "{{ pytorch_env }}"
   register: tts_synth
   failed_when: tts_synth.rc != 0

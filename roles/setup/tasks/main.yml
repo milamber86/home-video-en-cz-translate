@@ -304,6 +304,19 @@
   changed_when: false
   failed_when: xtts_import.rc != 0
 
+- name: Prefetch pretrained XTTS-v2 weights (includes Czech)
+  ansible.builtin.command:
+    argv:
+      - "{{ xtts_python }}"
+      - "{{ scripts_dir }}/xtts_synth.py"
+      - --model
+      - "{{ xtts_model }}"
+      - --prefetch
+    creates: "{{ ansible_env.HOME }}/Library/Application Support/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth"
+  environment: "{{ brew_env | combine({'COQUI_TOS_AGREED': '1', 'CUDA_VISIBLE_DEVICES': ''}) }}"
+  async: 3600
+  poll: 15
+
 - name: Verify ffmpeg
   ansible.builtin.command:
     argv:

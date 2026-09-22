@@ -39,7 +39,8 @@ marian_model: Helsinki-NLP/opus-mt-tc-big-en-ces_slk
 
 force_translate: false
 force_tts: false
-# Wipe per-cue WAVs. force_tts only deletes czech_vocals.wav so TTS can resume.
+# Wipe per-cue WAVs even when czech_vocals.wav is already gone.
+# force_tts also deletes tts/segments so cues regenerate instead of resuming.
 tts_fresh: false
 
 # Piper (stock male Czech voice)
@@ -47,12 +48,14 @@ piper_voice_dir: "{{ playbook_dir }}/models/piper"
 piper_voice: cs_CZ-jirka-medium
 piper_voice_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/cs/cs_CZ/jirka/medium
 
-# Coqui lives in an isolated venv (old transformers). Used for female VITS.
+# Coqui lives in an isolated venv (old transformers). XTTS-v2 is the default cloner.
 xtts_venv: "{{ playbook_dir }}/.venv-xtts"
 xtts_python: "{{ xtts_venv }}/bin/python"
+xtts_model: tts_models/multilingual/multi-dataset/xtts_v2
 tts_vits_model: tts_models/cs/cv/vits
 
-# Voice / TTS. auto uses Czech F5 + vocals.wav when models/f5_czech exists.
+# Voice / TTS. auto uses pretrained XTTS-v2 (Czech included) when model.pth is cached.
+# Czech F5 is opt-in: tts_engine=f5.
 voice_mode: clone
 tts_voice_gender: male
 voice_ref_wav: "{{ playbook_dir }}/files/voices/czech_default_ref.wav"

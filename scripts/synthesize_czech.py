@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--duration", type=float, help="Video duration seconds (required unless --smoke-test)")
     p.add_argument("--device", default="mps")
     p.add_argument("--engine", default="auto", choices=("auto", "f5", "xtts", "piper", "vits"))
-    p.add_argument("--voice-mode", choices=("clone", "bundled"), default="bundled")
+    p.add_argument("--voice-mode", choices=("clone", "bundled"), default="clone")
     p.add_argument("--voice-gender", choices=("male", "female"), default="male")
     p.add_argument("--vocals", help="Original vocals.wav for clone mode")
     p.add_argument("--ref-audio", help="Bundled or explicit reference WAV")
@@ -96,9 +96,16 @@ def pick_reference_clip(vocals: Path, dest: Path, target_sec: float = 10.0) -> P
     if len(mono) <= window:
         sf.write(str(dest), mono, sr)
         return dest
+    # Skip typical intro music / outro fade so the clip is speech, not a sting.
+    skip = int(2.0 * sr)
+    tail = int(1.0 * sr)
+    if len(mono) > window + skip + tail:
+        search_from, search_to = skip, len(mono) - tail
+    else:
+        search_from, search_to = 0, len(mono)
     hop = max(int(0.25 * sr), 1)
-    best_i, best_e = 0, -1.0
-    for i in range(0, len(mono) - window + 1, hop):
+    best_i, best_e = search_from, -1.0
+    for i in range(search_from, search_to - window + 1, hop):
         chunk = mono[i : i + window]
         energy = float(np.mean(chunk * chunk))
         if energy > best_e:
@@ -142,6 +149,18 @@ def czech_f5_ready(args: argparse.Namespace) -> bool:
     )
 
 
+def xtts_cache_dir(model: str = XTTS_MODEL) -> Path:
+    slug = (model or XTTS_MODEL).replace("/", "--")
+    return Path.home() / "Library/Application Support/tts" / slug
+
+
+def xtts_pretrained_ready(args: argparse.Namespace) -> bool:
+    """True when .venv-xtts exists and Coqui's pretrained XTTS-v2 (incl. Czech) is cached."""
+    if not _path_ready(args.xtts_python):
+        return False
+    return (xtts_cache_dir(XTTS_MODEL) / "model.pth").is_file()
+
+
 def stock_engine(gender: str) -> str:
     return "vits" if gender == "female" else "piper"
 
@@ -156,13 +175,17 @@ def select_engine(args: argparse.Namespace) -> str:
         raise SystemExit(f"Unsupported --voice-gender {args.voice_gender}")
     requested = (args.engine or "auto").strip().lower()
     if requested == "auto":
+        speaker_ok = _path_ready(args.vocals) or _path_ready(args.ref_audio)
+        if xtts_pretrained_ready(args) and speaker_ok:
+            apple_device.log("TTS auto: pretrained XTTS-v2 (Czech)")
+            return "xtts"
         if czech_f5_ready(args):
             apple_device.log(f"TTS auto: Czech F5 checkpoint {args.ckpt}")
             return "f5"
-        if args.voice_mode == "clone":
+        if args.voice_mode == "clone" and not xtts_pretrained_ready(args):
             apple_device.log(
-                "voice_mode=clone needs a Czech F5 checkpoint from "
-                "train_czech_tts.yml; falling back to a stock "
+                "voice_mode=clone needs pretrained XTTS-v2 "
+                "(run setup, or tts_engine=f5); falling back to a stock "
                 f"{gender} voice"
             )
         return stock_engine(gender)
@@ -400,21 +423,11 @@ def fit_to_slot(
         gen_sec = float(sf.info(str(work)).duration)
 
     if gen_sec > target_sec + 0.02:
-        trimmed = tmp_dir / f"{stem}.trim.wav"
-        fade = min(0.04, target_sec / 4)
-        run_ffmpeg(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(work),
-                "-af",
-                f"atrim=0:{target_sec:.6f},afade=t=out:st={max(target_sec - fade, 0):.6f}:d={fade:.6f}",
-                str(trimmed),
-            ]
+        # Do not chop words. Overlay may overlap the next cue slightly.
+        apple_device.log(
+            f"TTS slot overflow {gen_sec:.2f}s > {target_sec:.2f}s after "
+            f"speed {max_speed:.2f}x; keeping the full utterance"
         )
-        work = trimmed
-        gen_sec = float(sf.info(str(work)).duration)
 
     if gen_sec < target_sec - 0.02:
         pad = target_sec - gen_sec
@@ -482,19 +495,17 @@ def resolve_speaker(args: argparse.Namespace, job_ref: Path, engine: str) -> tup
             raise SystemExit("Bundled F5 voice requires a non-empty reference transcript")
         return Path(args.ref_audio), text
 
-    if args.ref_audio and Path(args.ref_audio).is_file():
-        ref = Path(args.ref_audio)
-        text = read_ref_text(args.ref_text)
-        if engine == "f5" and not text:
-            text = transcribe_ref(ref, args.whisper_model)
-        return ref, text
-
     if not args.vocals or not Path(args.vocals).is_file():
         raise SystemExit("voice_mode=clone requires --vocals pointing at vocals.wav")
     ref = pick_reference_clip(Path(args.vocals), job_ref)
-    text = read_ref_text(args.ref_text)
-    if engine == "f5" and not text:
-        text = transcribe_ref(ref, args.whisper_model)
+    if engine != "f5":
+        return ref, ""
+    # F5 must pair the extracted clip with its own transcript. The bundled
+    # czech_default_ref.txt is a dummy Czech line and does not describe vocals.wav.
+    if args.ref_text:
+        apple_device.log("Ignoring --ref-text in clone mode; transcribing the source clip")
+    text = transcribe_ref(ref, args.whisper_model)
+    job_ref.with_suffix(".txt").write_text(text + "\n", encoding="utf-8")
     return ref, text
 
 
