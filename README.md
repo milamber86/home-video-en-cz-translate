@@ -41,11 +41,12 @@ Useful extra-vars:
 | `voice_mode` | `clone` | Clone the source speaker. `auto` uses pretrained XTTS-v2 when those weights are cached. `bundled` is stock Piper/VITS (or Czech F5 if you set `tts_engine=f5` and add `files/voices/czech_default_ref.wav`). |
 | `tts_voice_gender` | `male` | `male` = Piper `cs_CZ-jirka-medium`. `female` = Coqui `tts_models/cs/cv/vits`. Ignored for XTTS clone. |
 | `tts_engine` | `auto` | Prefers pretrained XTTS-v2 (Czech included) when `model.pth` is cached. Else Czech F5 if `models/f5_czech` exists. Else Piper/VITS by gender. |
+| `speaker_gender` | `male` | First-person narrator gender for Czech agreement (`já` / `řekl jsem`) |
 | `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist |
 | `force_tts` | `false` | Redo Czech vocals (wipes `tts/segments`) and remux |
 | `output_container` | `mkv` | `mkv` (native SRT) or `mp4` (`mov_text`) |
 | `ollama_model` | `qwen2.5:14b` | Must exist after the `ollama` role pulls it |
-| `ytdlp_cookies_from_browser` | `""` | e.g. `chrome` if YouTube returns 429 |
+| `ytdlp_cookies_from_browser` | `""` | e.g. `chrome` if YouTube returns 429 or 403 even with Deno |
 
 Tags: `setup`, `ollama`, `download`, `demucs`, `whisper_translate`, `f5_tts`, `remux`.
 
@@ -81,7 +82,7 @@ Output lands in `work/<youtube_id>/output/<youtube_id>.cs.mkv` (or `.mp4`).
 
 ## Translation
 
-English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Ollama translates those sentences with the previous few English+Czech sentences as read-only context, then runs a grammar revision pass (gender/case agreement, Czech word order, no English calques). If the API is down, JSON is malformed, or counts mismatch, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
+English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Ollama builds a terminology glossary (names, recurring terms), translates with previous English+Czech as read-only context, then runs a native Czech polish pass (gender/case, calques, natural phrasing). The on-screen `subs/cs.srt` stays readable. At TTS time, numbers, abbreviations, and glossary name pronunciations are expanded into spoken Czech (`1976` → `devatenáct set sedmdesát šest`, `CEO` → `generální ředitel`). If the API is down, JSON is malformed, or counts mismatch, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
 
 ## Czech speech
 

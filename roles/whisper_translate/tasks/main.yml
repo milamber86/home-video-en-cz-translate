@@ -47,6 +47,8 @@
       - "{{ ollama_model }}"
       - --marian-model
       - "{{ marian_model }}"
+      - --speaker-gender
+      - "{{ speaker_gender }}"
   environment: "{{ pytorch_env }}"
   register: whisper_with_srt
   failed_when: whisper_with_srt.rc != 0
@@ -77,6 +79,8 @@
       - "{{ ollama_model }}"
       - --marian-model
       - "{{ marian_model }}"
+      - --speaker-gender
+      - "{{ speaker_gender }}"
   environment: "{{ pytorch_env }}"
   register: whisper_from_audio
   failed_when: whisper_from_audio.rc != 0

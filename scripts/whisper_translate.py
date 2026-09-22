@@ -28,21 +28,25 @@ from srtutil import (  # noqa: E402
     segments_to_cues,
 )
 
-CONTEXT_SENTENCES = 4
+CONTEXT_SENTENCES = 8
+POLISH_WINDOW = 10
 
 SYSTEM_PROMPT = (
-    "You are a professional audiovisual translator from English to Czech. "
-    "Translate each English subtitle sentence into natural, spoken Czech. "
-    "The items are consecutive sentences from the same talk, not isolated fragments. "
-    "Preserve clause links and finish each thought; do not restart meaning at "
-    "array boundaries. Keep roughly the same length as the source. "
-    "Use correct Czech gender, number, and case agreement, and Czech word order. "
-    "Do not calque English syntax or stack tautologies "
-    "(bad: 'této názoru' → good: 'tohoto názoru'; "
-    "bad: 'současnou ekonomickou systémem' → good: 'současným ekonomickým systémem'; "
-    "bad: 'by měla stát přednost vytváření a udržování institucí nezbytných pro "
-    "funkční fungování trhů' → good: 'by stát měl dávat přednost vytváření a "
-    "udržování institucí nezbytných pro fungování trhů'). "
+    "Jsi profesionální audiovizuální překladatel do češtiny. "
+    "Piš přirozenou mluvenou češtinu pro dabing YouTube výkladu, ne doslovný kalk. "
+    "You translate consecutive subtitle sentences from the same talk. "
+    "Keep roughly the same length as the source and finish each thought. "
+    "Gramatika: shoda v rodě, čísle a pádě; český slovosled (příklonky, genitiv po číslovce). "
+    "Rod podstatných jmen dodržuj (video = střední: toto video; teorie = ženský; "
+    "systém = mužský; cena = ženský). "
+    "First-person narrator gender is given below; já/řeknu/vysvětlím must agree. "
+    "Prefer established Czech wording over awkward synonyms "
+    "(frowned upon → nahlíženo s despektem / považováno za neakademické, "
+    "not 'pohledávána'; distanced themselves → distancovali se, not 'vzdálili se'; "
+    "CEO → generální ředitel). "
+    "Složité anglické souvětí přestav do české větné stavby, nekalkuj slovosled. "
+    "Use the supplied glossary consistently; fix obvious ASR name typos "
+    "(Freriedman→Friedman, Noble→Nobel when the prize is meant). "
     "Do not add explanations, numbering, or timestamps. "
     "Previous sentences given as context are read-only: do not translate or "
     "repeat them in the output. "
@@ -50,16 +54,31 @@ SYSTEM_PROMPT = (
     "and order as the input sentences array."
 )
 
-REVISE_PROMPT = (
-    "You are a native Czech subtitle editor. Revise each Czech draft so it is "
-    "grammatical spoken Czech. Fix gender, number, and case agreement. Use Czech "
-    "word order, not English calques. Do not change meaning or add content. "
-    "Keep roughly the same length. Examples: 'této názoru' → 'tohoto názoru'; "
-    "'současnou ekonomickou systémem' → 'současným ekonomickým systémem'; "
-    "'by měla stát přednost … funkční fungování trhů' → "
-    "'by stát měl dávat přednost … fungování trhů'. "
+POLISH_PROMPT = (
+    "Jsi rodilý český jazykový redaktor dabingu. "
+    "Přepiš každou českou větu tak, jak by ji řekl rodilý mluvčí ve výkladovém videu. "
+    "Oprav rod, číslo, pád a shodu s vypravěčem. "
+    "Odstraň anglické kalky a neohrabané vazby. "
+    "Nahraď významově vedlejší synonyma ustáleným českým výrazem. "
+    "Složité konstrukce zjednoduš do přirozené češtiny, význam neměň a nic nepřidávej. "
+    "Délka zůstane zhruba stejná. Dodrž slovníček. "
+    "Příklady špatně→správně: 'této názoru'→'tohoto názoru'; "
+    "'současnou ekonomickou systémem'→'současným ekonomickým systémem'; "
+    "'tato videí'→'toto video'; 'Jeich strategie'→'Jejich strategie'; "
+    "'předseda výkonného výboru'→'generální ředitel' pokud zdroj říká CEO. "
     "Return ONLY a JSON array of Czech strings with exactly the same length "
     "and order as the input drafts."
+)
+
+GLOSSARY_PROMPT = (
+    "From the English YouTube transcript extract a terminology glossary for "
+    "Czech translation. Correct obvious ASR misspellings of names. "
+    "For each person, org, recurring term, or abbreviation give the Czech "
+    "written form and, when TTS would mispronounce an English name, a Czech "
+    "phonetic spelling (tts). "
+    "Return ONLY JSON: {\"speaker_gender\": \"male|female|unknown\", "
+    "\"terms\": [{\"en\": \"\", \"cs\": \"\", \"kind\": "
+    "\"person|org|place|term|abbr\", \"gender\": \"m|f|n|\", \"tts\": \"\"}]}"
 )
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
@@ -89,8 +108,19 @@ def parse_args() -> argparse.Namespace:
         "--marian-model",
         default="Helsinki-NLP/opus-mt-tc-big-en-ces_slk",
     )
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--ollama-timeout", type=float, default=180.0)
+    p.add_argument("--batch-size", type=int, default=6)
+    p.add_argument("--ollama-timeout", type=float, default=240.0)
+    p.add_argument(
+        "--speaker-gender",
+        choices=("male", "female", "unknown"),
+        default="male",
+        help="Gender of the first-person narrator for Czech agreement",
+    )
+    p.add_argument(
+        "--glossary-out",
+        default="",
+        help="Write glossary JSON here (default: next to --out-cs)",
+    )
     return p.parse_args()
 
 
@@ -253,17 +283,155 @@ def ollama_chat(
     raise last_exc or RuntimeError("Ollama chat failed")
 
 
+def parse_json_value(text: str) -> object:
+    text = _FENCE_RE.sub("", (text or "").strip())
+    if not text:
+        raise ValueError("Empty model output")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    start = text.find("[")
+    end = text.rfind("]")
+    if start >= 0 and end > start:
+        return json.loads(text[start : end + 1])
+    raise ValueError("No JSON in model output")
+
+
+def ollama_json(url: str, model: str, system: str, user: str, timeout: float) -> object:
+    import httpx
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    r = httpx.post(f"{url.rstrip('/')}/api/chat", json=payload, timeout=timeout)
+    r.raise_for_status()
+    content = ((r.json().get("message") or {}).get("content") or "")
+    return parse_json_value(content)
+
+
+def speaker_instruction(gender: str) -> str:
+    if gender == "female":
+        return (
+            "Vypravěč je žena. První osoba je v ženském rodě "
+            "(řekla jsem, vysvětlím, byla jsem — ne řekl jsem)."
+        )
+    if gender == "male":
+        return (
+            "Vypravěč je muž. První osoba je v mužském rodě "
+            "(řekl jsem, vysvětlím, byl jsem — ne řekla jsem). "
+            "Oslovení diváka v mužském rodě jen tam, kde angličtina míří na muže; "
+            "'you' obecně překládej neutrálně (vy/jste)."
+        )
+    return (
+        "Rod vypravěče není jistý; drž ho konzistentní podle slovníčku "
+        "a okolních vět."
+    )
+
+
+def format_glossary(glossary: dict | None) -> str:
+    if not glossary:
+        return ""
+    terms = glossary.get("terms") if isinstance(glossary, dict) else None
+    if not isinstance(terms, list) or not terms:
+        return ""
+    lines = []
+    for item in terms:
+        if not isinstance(item, dict):
+            continue
+        en = (item.get("en") or "").strip()
+        cs = (item.get("cs") or "").strip()
+        if not en or not cs:
+            continue
+        extra = []
+        kind = (item.get("kind") or "").strip()
+        gender = (item.get("gender") or "").strip()
+        if kind:
+            extra.append(kind)
+        if gender:
+            extra.append(f"rod {gender}")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        lines.append(f"- {en} → {cs}{suffix}")
+    if not lines:
+        return ""
+    return "Slovníček, dodržuj konzistentně:\n" + "\n".join(lines)
+
+
+def empty_glossary(gender: str) -> dict:
+    return {"speaker_gender": gender, "terms": []}
+
+
+def extract_glossary(
+    url: str,
+    model: str,
+    texts: list[str],
+    timeout: float,
+    fallback_gender: str,
+) -> dict:
+    blob = "\n".join(t for t in texts if t.strip())
+    if len(blob) > 24000:
+        blob = blob[:24000]
+    try:
+        data = ollama_json(
+            url,
+            model,
+            GLOSSARY_PROMPT,
+            "Transcript:\n" + blob,
+            timeout,
+        )
+    except Exception as exc:
+        apple_device.log(f"Glossary extraction skipped ({exc})")
+        return empty_glossary(fallback_gender)
+    if not isinstance(data, dict):
+        return empty_glossary(fallback_gender)
+    terms = data.get("terms")
+    if not isinstance(terms, list):
+        data["terms"] = []
+    inferred = str(data.get("speaker_gender") or "").strip().lower()
+    if fallback_gender in ("male", "female"):
+        data["speaker_gender"] = fallback_gender
+    elif inferred in ("male", "female", "unknown"):
+        data["speaker_gender"] = inferred
+    else:
+        data["speaker_gender"] = "unknown"
+    apple_device.log(
+        f"Glossary terms={len(data.get('terms') or [])} "
+        f"speaker_gender={data['speaker_gender']}"
+    )
+    return data
+
+
 def ollama_translate_batch(
     url: str,
     model: str,
     texts: list[str],
     context: list[tuple[str, str]],
     timeout: float,
+    *,
+    gender: str,
+    glossary: dict | None,
 ) -> list[str]:
     if all(not t.strip() for t in texts):
         return [""] * len(texts)
 
-    user_parts: list[str] = []
+    user_parts: list[str] = [speaker_instruction(gender)]
+    gloss = format_glossary(glossary)
+    if gloss:
+        user_parts.append(gloss)
     if context:
         user_parts.append(
             "Previous sentences (read-only context, do not translate or output):\n"
@@ -289,38 +457,71 @@ def ollama_translate_batch(
     )
 
 
-def ollama_revise_batch(
+def ollama_polish_window(
+    url: str,
+    model: str,
+    english: list[str],
+    drafts: list[str],
+    prior_cs: list[str],
+    timeout: float,
+    *,
+    gender: str,
+    glossary: dict | None,
+) -> list[str]:
+    if all(not t.strip() for t in drafts):
+        return list(drafts)
+    user_parts: list[str] = [speaker_instruction(gender)]
+    gloss = format_glossary(glossary)
+    if gloss:
+        user_parts.append(gloss)
+    if prior_cs:
+        user_parts.append(
+            "Already-finalized previous Czech (read-only, do not output):\n"
+            + json.dumps(prior_cs, ensure_ascii=False)
+        )
+    pairs = [{"en": en, "cs": cs} for en, cs in zip(english, drafts)]
+    user_parts.append(
+        "Rewrite the Czech drafts as native spoken Czech. Each object has the "
+        f"English source (en) and the Czech draft (cs). Return a JSON array of "
+        f"exactly {len(drafts)} revised Czech strings in the same order:\n"
+        + json.dumps(pairs, ensure_ascii=False)
+    )
+    return ollama_chat(
+        url, model, POLISH_PROMPT, "\n\n".join(user_parts), drafts, timeout
+    )
+
+
+def polish_document(
     url: str,
     model: str,
     english: list[str],
     drafts: list[str],
     timeout: float,
+    *,
+    gender: str,
+    glossary: dict | None,
 ) -> list[str]:
-    if all(not t.strip() for t in drafts):
-        return list(drafts)
-    pairs = [{"en": en, "cs": cs} for en, cs in zip(english, drafts)]
-    user = (
-        "Revise the Czech drafts. Each object has the English source (en) and "
-        f"the Czech draft (cs). Return a JSON array of exactly {len(drafts)} "
-        "revised Czech strings in the same order:\n"
-        + json.dumps(pairs, ensure_ascii=False)
-    )
-    return ollama_chat(url, model, REVISE_PROMPT, user, drafts, timeout)
-
-
-def ollama_translate_and_revise(
-    url: str,
-    model: str,
-    texts: list[str],
-    context: list[tuple[str, str]],
-    timeout: float,
-) -> list[str]:
-    draft = ollama_translate_batch(url, model, texts, context, timeout)
-    try:
-        return ollama_revise_batch(url, model, texts, draft, timeout)
-    except Exception as exc:
-        apple_device.log(f"Ollama revise skipped ({exc}); keeping draft")
-        return draft
+    out = list(drafts)
+    window = max(1, POLISH_WINDOW)
+    for i in range(0, len(out), window):
+        chunk_en = english[i : i + window]
+        chunk_cs = out[i : i + window]
+        prior = out[max(0, i - CONTEXT_SENTENCES) : i]
+        try:
+            revised = ollama_polish_window(
+                url,
+                model,
+                chunk_en,
+                chunk_cs,
+                prior,
+                timeout,
+                gender=gender,
+                glossary=glossary,
+            )
+            out[i : i + window] = revised
+        except Exception as exc:
+            apple_device.log(f"Polish window {i + 1}-{i + len(chunk_cs)} skipped ({exc})")
+    return out
 
 
 def marian_translate(texts: list[str], model: str, device: str) -> list[str]:
@@ -370,9 +571,12 @@ def marian_translate(texts: list[str], model: str, device: str) -> list[str]:
 def translate_cues(
     texts: list[str],
     args: argparse.Namespace,
+    glossary_path: Path | None = None,
 ) -> list[str]:
     backend = args.translation_backend
     device = apple_device.device_str(args.device)
+    gender = (args.speaker_gender or "male").strip().lower()
+    glossary = empty_glossary(gender)
 
     def via_marian(subset: list[str] | None = None) -> list[str]:
         return marian_translate(subset if subset is not None else texts, args.marian_model, device)
@@ -388,7 +592,19 @@ def translate_cues(
         return via_marian()
 
     model = pick_ollama_model(tags, args.ollama_model)
-    apple_device.log(f"Translating with Ollama model={model} (grammar revise pass)")
+    apple_device.log(f"Translating with Ollama model={model} (glossary + native polish)")
+    glossary = extract_glossary(
+        args.ollama_url, model, texts, args.ollama_timeout, gender
+    )
+    gender = str(glossary.get("speaker_gender") or gender)
+    if glossary_path is not None:
+        glossary_path.parent.mkdir(parents=True, exist_ok=True)
+        glossary_path.write_text(
+            json.dumps(glossary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        apple_device.log(f"Wrote {glossary_path}")
+
     translated: list[str] = []
     bs = max(1, args.batch_size)
     ctx_n = CONTEXT_SENTENCES
@@ -398,8 +614,14 @@ def translate_cues(
         ctx = list(zip(ctx_en, translated[-len(ctx_en) :] if ctx_en else []))
         try:
             translated.extend(
-                ollama_translate_and_revise(
-                    args.ollama_url, model, chunk, ctx, args.ollama_timeout
+                ollama_translate_batch(
+                    args.ollama_url,
+                    model,
+                    chunk,
+                    ctx,
+                    args.ollama_timeout,
+                    gender=gender,
+                    glossary=glossary,
                 )
             )
         except Exception as exc:
@@ -410,12 +632,14 @@ def translate_cues(
                     zip(one_en, translated[-len(one_en) :] if one_en else [])
                 )
                 try:
-                    one = ollama_translate_and_revise(
+                    one = ollama_translate_batch(
                         args.ollama_url,
                         model,
                         [cue_text],
                         one_ctx,
                         args.ollama_timeout,
+                        gender=gender,
+                        glossary=glossary,
                     )
                     translated.append(one[0])
                 except Exception as cue_exc:
@@ -431,7 +655,16 @@ def translate_cues(
                     return translated
     if len(translated) != len(texts):
         raise RuntimeError("Translation count mismatch after Ollama")
-    return translated
+    apple_device.log("Polishing Czech as a native voice-over")
+    return polish_document(
+        args.ollama_url,
+        model,
+        texts,
+        translated,
+        args.ollama_timeout,
+        gender=gender,
+        glossary=glossary,
+    )
 
 
 def english_cues(args: argparse.Namespace) -> list[srt.Subtitle]:
@@ -457,8 +690,9 @@ def main() -> int:
     cues = english_cues(args)
     save_srt(out_en, cues)
     texts = [c.content for c in cues]
+    glossary_path = Path(args.glossary_out) if args.glossary_out else out_cs.with_name("glossary.json")
     apple_device.log(f"Translating {len(texts)} sentences to Czech")
-    czech = translate_cues(texts, args)
+    czech = translate_cues(texts, args, glossary_path=glossary_path)
     if len(czech) != len(cues):
         raise SystemExit(
             f"Translation produced {len(czech)} cues, expected {len(cues)}"

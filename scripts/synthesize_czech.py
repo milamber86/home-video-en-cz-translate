@@ -24,6 +24,7 @@ apple_device.bootstrap_mps_fallback()
 import numpy as np  # noqa: E402
 import soundfile as sf  # noqa: E402
 from srtutil import cue_seconds, load_srt  # noqa: E402
+from czech_tts_text import expand_for_tts  # noqa: E402
 
 BASE_GRAPHEME_FIX = str.maketrans({"ů": "ú", "Ů": "Ú", "ď": "d", "Ď": "D"})
 VITS_MODEL = "tts_models/cs/cv/vits"
@@ -54,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--piper-model", default="", help="Piper ONNX voice (cs_CZ-jirka-medium.onnx)")
     p.add_argument("--xtts-python", default="", help="Interpreter for isolated .venv-xtts (VITS/XTTS)")
     p.add_argument("--vits-model", default=VITS_MODEL, help="Coqui Czech VITS model name")
+    p.add_argument(
+        "--glossary",
+        default="",
+        help="glossary.json with name pronunciations (default: next to --srt)",
+    )
     p.add_argument("--fresh", action="store_true", help="Ignore existing per-cue WAVs")
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--smoke-text", default="Za svítání šel dům přes louku.")
@@ -230,6 +236,11 @@ def normalize_czech(text: str, engine: str, using_finetune: bool) -> str:
     if text and text[-1] not in ".!?…":
         text += "."
     return text
+
+
+def spoken_czech(text: str, engine: str, using_finetune: bool, glossary_path: Path | None) -> str:
+    text = normalize_czech(text, engine, using_finetune)
+    return expand_for_tts(text, glossary_path)
 
 
 class _DoneFuture:
@@ -573,7 +584,7 @@ def main() -> int:
         apple_device.log(f"Piper voice={model}")
 
     if args.smoke_test:
-        text = normalize_czech(args.smoke_text, engine, using_finetune)
+        text = spoken_czech(args.smoke_text, engine, using_finetune, None)
         with tempfile.TemporaryDirectory(prefix="ttssmoke_") as tmp:
             raw = Path(tmp) / "smoke.wav"
             if engine == "f5":
@@ -599,6 +610,10 @@ def main() -> int:
         return 0
 
     cues = load_srt(args.srt, sentences=False)
+    glossary_file = Path(args.glossary) if args.glossary else Path(args.srt).with_name("glossary.json")
+    glossary_path: Path | None = glossary_file if glossary_file.is_file() else None
+    if glossary_path is not None:
+        apple_device.log(f"TTS glossary={glossary_path}")
     pieces: list[tuple[float, np.ndarray]] = []
     gen_sr = 24000
     pending_coqui: list[dict] = []
@@ -607,7 +622,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ttscue_") as tmp:
         tmp_dir = Path(tmp)
         for i, cue in enumerate(cues, start=1):
-            text = normalize_czech(cue.content, engine, using_finetune)
+            text = spoken_czech(cue.content, engine, using_finetune, glossary_path)
             if not text:
                 continue
             fitted = segments_dir / f"{i:04d}.{cache_id}.wav"

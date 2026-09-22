@@ -178,6 +178,7 @@
       - ffmpeg
       - uv
       - espeak-ng
+      - deno
       - "{{ python_brew_pkg }}"
   register: brew_install
   environment: "{{ brew_env }}"

@@ -6,12 +6,28 @@
       - youtube_url | length > 0
     fail_msg: "Pass -e youtube_url='https://www.youtube.com/watch?v=...'"
 
+- name: Require Deno for YouTube JS challenges
+  ansible.builtin.stat:
+    path: "{{ brew_bin }}/deno"
+  register: deno_bin
+
+- name: Fail if Deno is missing
+  ansible.builtin.fail:
+    msg: >-
+      Deno is required for yt-dlp YouTube downloads (HTTP 403 without a JS runtime).
+      Re-run with --tags setup so Homebrew can install deno.
+  when: not deno_bin.stat.exists
+
 - name: Resolve YouTube video ID
   ansible.builtin.command:
     argv:
       - "{{ venv_python }}"
       - -m
       - yt_dlp
+      - --js-runtimes
+      - "deno:{{ brew_bin }}/deno"
+      - --remote-components
+      - ejs:github
       - --print
       - id
       - --skip-download
@@ -19,6 +35,7 @@
       - "{{ youtube_url }}"
   register: ytdlp_id
   changed_when: false
+  environment: "{{ brew_env }}"
 
 - name: Set job facts
   ansible.builtin.set_fact:
@@ -45,14 +62,36 @@
     path: "{{ job_dir }}/raw/{{ video_id }}.mp4"
   register: video_stat
 
+- name: Find leftover yt-dlp part files
+  ansible.builtin.find:
+    paths: "{{ job_dir }}/raw"
+    patterns:
+      - "*.part"
+      - "*.ytdl"
+  register: ytdlp_parts
+  when: not video_stat.stat.exists
+
+- name: Remove leftover yt-dlp part files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ ytdlp_parts.files | default([]) }}"
+  when: not video_stat.stat.exists
+
 - name: Download video and English subtitles
   ansible.builtin.command:
-    argv:
+    argv: "{{ ytdlp_args + ytdlp_cookie_args + [youtube_url] }}"
+  vars:
+    ytdlp_args:
       - "{{ venv_python }}"
       - -m
       - yt_dlp
+      - --js-runtimes
+      - "deno:{{ brew_bin }}/deno"
+      - --remote-components
+      - ejs:github
       - --format
-      - bv*+ba/b
+      - "{{ ytdlp_format }}"
       - --merge-output-format
       - mp4
       - --write-subs
@@ -62,44 +101,18 @@
       - --convert-subs
       - srt
       - --restrict-filenames
-      - --no-overwrites
+      - --continue
+      - --retries
+      - "10"
+      - --fragment-retries
+      - "10"
       - --output
       - "{{ job_dir }}/raw/%(id)s.%(ext)s"
-      - "{{ youtube_url }}"
+    ytdlp_cookie_args: "{{ ['--cookies-from-browser', ytdlp_cookies_from_browser] if ytdlp_cookies_from_browser | length > 0 else [] }}"
   register: ytdlp_download
   failed_when: ytdlp_download.rc != 0
-  when:
-    - not video_stat.stat.exists
-    - ytdlp_cookies_from_browser | length == 0
-
-- name: Download video and English subtitles (browser cookies)
-  ansible.builtin.command:
-    argv:
-      - "{{ venv_python }}"
-      - -m
-      - yt_dlp
-      - --format
-      - bv*+ba/b
-      - --merge-output-format
-      - mp4
-      - --write-subs
-      - --write-auto-subs
-      - --sub-langs
-      - en.*
-      - --convert-subs
-      - srt
-      - --restrict-filenames
-      - --no-overwrites
-      - --output
-      - "{{ job_dir }}/raw/%(id)s.%(ext)s"
-      - --cookies-from-browser
-      - "{{ ytdlp_cookies_from_browser }}"
-      - "{{ youtube_url }}"
-  register: ytdlp_download_cookies
-  failed_when: ytdlp_download_cookies.rc != 0
-  when:
-    - not video_stat.stat.exists
-    - ytdlp_cookies_from_browser | length > 0
+  environment: "{{ brew_env }}"
+  when: not video_stat.stat.exists
 
 - name: Recheck downloaded video
   ansible.builtin.stat:

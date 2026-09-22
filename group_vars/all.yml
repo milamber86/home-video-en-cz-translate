@@ -36,6 +36,8 @@ ollama_url: http://127.0.0.1:11434
 ollama_model: qwen2.5:14b
 ollama_bind: 127.0.0.1:11434
 marian_model: Helsinki-NLP/opus-mt-tc-big-en-ces_slk
+# First-person narrator gender for Czech agreement (já/řekl jsem).
+speaker_gender: male
 
 force_translate: false
 force_tts: false
@@ -101,8 +103,10 @@ output_container: mkv
 vocals_gain: 1.0
 bed_gain: 0.85
 
-# yt-dlp
+# yt-dlp. Deno solves YouTube JS challenges (HTTP 403 without it).
 ytdlp_cookies_from_browser: ""
+# 1080p is enough for remux; 4K AV1 (e.g. format 401) often 403s.
+ytdlp_format: "bv*[height<=1080]+ba/b"
 
 # Demucs CLI --segment is an int; htdemucs transformer max is 7.8s
 demucs_model: htdemucs
