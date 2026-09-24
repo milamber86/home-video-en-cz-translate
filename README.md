@@ -41,11 +41,11 @@ Useful extra-vars:
 | `voice_mode` | `clone` | Clone the source speaker. `auto` uses pretrained XTTS-v2 when those weights are cached. `bundled` is stock Piper/VITS (or Czech F5 if you set `tts_engine=f5` and add `files/voices/czech_default_ref.wav`). |
 | `tts_voice_gender` | `male` | `male` = Piper `cs_CZ-jirka-medium`. `female` = Coqui `tts_models/cs/cv/vits`. Ignored for XTTS clone. |
 | `tts_engine` | `auto` | Prefers pretrained XTTS-v2 (Czech included) when `model.pth` is cached. Else Czech F5 if `models/f5_czech` exists. Else Piper/VITS by gender. |
-| `speaker_gender` | `male` | First-person narrator gender for Czech agreement (`já` / `řekl jsem`) |
+| `speaker_gender` | `auto` | Narrator gender for Czech agreement. `auto` infers from the transcript, then from `vocals.wav` pitch. Override with `male` or `female` |
 | `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist |
 | `force_tts` | `false` | Redo Czech vocals (wipes `tts/segments`) and remux |
 | `output_container` | `mkv` | `mkv` (native SRT) or `mp4` (`mov_text`) |
-| `ollama_model` | `qwen2.5:14b` | Must exist after the `ollama` role pulls it |
+| `ollama_model` | `translategemma:12b` | Pulled by the `ollama` role. Dedicated EN→CS. `translategemma:27b` is stronger; `qwen2.5:14b` is a general-chat fallback |
 | `ytdlp_cookies_from_browser` | `""` | e.g. `chrome` if YouTube returns 429 or 403 even with Deno |
 
 Tags: `setup`, `ollama`, `download`, `demucs`, `whisper_translate`, `f5_tts`, `remux`.
@@ -82,7 +82,15 @@ Output lands in `work/<youtube_id>/output/<youtube_id>.cs.mkv` (or `.mp4`).
 
 ## Translation
 
-English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Ollama builds a terminology glossary (names, recurring terms), translates with previous English+Czech as read-only context, then runs a native Czech polish pass (gender/case, calques, natural phrasing). The on-screen `subs/cs.srt` stays readable. At TTS time, numbers, abbreviations, and glossary name pronunciations are expanded into spoken Czech (`1976` → `devatenáct set sedmdesát šest`, `CEO` → `generální ředitel`). If the API is down, JSON is malformed, or counts mismatch, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
+English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Speaker gender is inferred (`auto`: vocals pitch first, then the transcript if it has a clear quote) and passed into every translate prompt so Czech first-person agreement stays feminine or masculine. Override with `-e speaker_gender=female` or `male`. At TTS time, numbers and abbreviations are expanded into spoken Czech. If Ollama is down or a general-chat model returns bad JSON, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
+
+The default translator is [TranslateGemma](https://ai.google.dev/gemma/docs/translategemma/model-card) 12B (~8 GB): dedicated EN→CS, official plain-text prompt, one cue at a time with a short previous-line context and the detected speaker gender. `translategemma:27b` is stronger (~17 GB). `qwen2.5:14b` is a general-chat fallback (`-e ollama_model=qwen2.5:14b`). A second rewrite pass is not used: it made the Czech more literal.
+
+The `ollama` role pulls `translategemma:12b` if it is missing.
+
+**Fine-tuning (Inkling + Tinker):** Possible later, not the first move. Inkling is a huge generalist MoE; Tinker is a cloud LoRA API. Fine-tuning needs thousands of *human* EN–CS spoken-dub pairs. The current `cs.srt` is model output — training on it would lock in today's mistakes. If you later collect gold cues, SFT TranslateGemma or a mid-size Qwen on Tinker beats SFT Inkling. NLLB / MADLAD / Marian are dedicated MT but more literal than a dub needs.
+
+**Highest quality if you leave local-only:** DeepL or a strong cloud LLM with a tight spoken-Czech prompt.
 
 ## Czech speech
 

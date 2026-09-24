@@ -30,14 +30,17 @@ brew_env:
 whisper_backend: mlx
 whisper_model: mlx-community/whisper-large-v3-mlx
 
-# Translation (Ollama first, Marian fallback)
+# Translation (Ollama first, Marian fallback).
+# translategemma:12b is dedicated EN→CS (~8 GB). :27b is stronger, ~17 GB.
+# qwen2.5:14b remains available as a general-chat fallback.
 translation_backend: ollama_first
 ollama_url: http://127.0.0.1:11434
-ollama_model: qwen2.5:14b
+ollama_model: translategemma:12b
 ollama_bind: 127.0.0.1:11434
 marian_model: Helsinki-NLP/opus-mt-tc-big-en-ces_slk
-# First-person narrator gender for Czech agreement (já/řekl jsem).
-speaker_gender: male
+# First-person narrator gender for Czech agreement (já/řekla jsem).
+# auto = infer from transcript, then from vocals pitch. Override with male/female.
+speaker_gender: auto
 
 force_translate: false
 force_tts: false
