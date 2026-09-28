@@ -138,9 +138,7 @@ def unroll_rolling_cues(cues: list[srt.Subtitle]) -> list[srt.Subtitle]:
             buf_words.extend(words)
         text = " ".join(buf_words)
         dur = (buf_end - buf_start).total_seconds()
-        if text.endswith((".", "?", "!", "…")):
-            flush()
-        elif dur >= _HARD_PACK_SECONDS:
+        if text.endswith((".", "?", "!", "…")) or dur >= _HARD_PACK_SECONDS:
             flush()
     flush()
     return packed

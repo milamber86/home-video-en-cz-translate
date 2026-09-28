@@ -151,3 +151,17 @@ models/piper/   Piper cs_CZ-jirka-medium (gitignored)
 models/f5_czech/  Trained Czech F5 checkpoint (gitignored)
 .venv-xtts/     Isolated Coqui env for XTTS-v2 and VITS (gitignored)
 ```
+
+## Development
+
+Pipeline Python dependencies are declared in `pyproject.toml` and pinned in `uv.lock`; the `setup` role installs exactly the locked versions with `uv sync --frozen`. After changing dependencies, run `uv lock` and commit `uv.lock`. The training playbook still editable-installs `vendor/F5-TTS` on demand; a later `uv sync` reverts the pipeline venv to the locked wheel.
+
+Tests and lint only need the light dependencies (`pytest`, `ruff`, `mypy`, `srt`, `num2words`, `numpy`, `soundfile`):
+
+```bash
+pytest
+ruff check scripts tests
+mypy scripts
+```
+
+CI (`.github/workflows/ci.yml`) runs the test suite, ruff, mypy, `ansible-playbook --syntax-check` for both playbooks, and verifies `uv.lock` is current.

@@ -14,7 +14,7 @@ import os
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -27,7 +27,6 @@ apple_device.bootstrap_mps_fallback()
 
 import numpy as np  # noqa: E402
 import soundfile as sf  # noqa: E402
-
 
 PROGRESS_JSON = "progress.json"
 PROGRESS_LOG = "progress.log"
@@ -229,7 +228,7 @@ def from_local(local_dir: Path, out_dir: Path, args: argparse.Namespace) -> int:
     wavs.mkdir(parents=True, exist_ok=True)
     with meta.open(encoding="utf-8-sig", newline="") as fh:
         reader = csv.reader(fh, delimiter="|")
-        header = next(reader, None)
+        next(reader, None)
         for i, row in enumerate(reader, start=1):
             if len(row) < 2:
                 continue
@@ -494,4 +493,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

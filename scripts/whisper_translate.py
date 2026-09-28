@@ -23,6 +23,7 @@ import device as apple_device  # noqa: E402
 apple_device.bootstrap_mps_fallback()
 
 import srt  # noqa: E402
+
 from srtutil import (  # noqa: E402
     drop_echo_cues,
     load_srt,
@@ -1130,4 +1131,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

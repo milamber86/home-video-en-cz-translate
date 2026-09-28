@@ -123,24 +123,24 @@ def _concat_wavs(paths: list[Path], dest: Path) -> None:
     import numpy as np
     import soundfile as sf
 
-    pieces = []
-    sr = None
-    gap = None
+    pieces: list[np.ndarray] = []
+    sr: int | None = None
+    gap: np.ndarray | None = None
     for path in paths:
         audio, this_sr = sf.read(str(path), always_2d=False)
         if sr is None:
-            sr = this_sr
+            sr = int(this_sr)
             gap = np.zeros(max(int(0.08 * sr), 1), dtype=np.float32)
         elif this_sr != sr:
             raise RuntimeError(f"Sample-rate mismatch {this_sr} vs {sr}")
         if pieces and gap is not None:
             pieces.append(gap)
         pieces.append(np.asarray(audio, dtype=np.float32))
-    if not pieces:
+    if not pieces or sr is None:
         raise RuntimeError("No Coqui chunks to concatenate")
     dest.parent.mkdir(parents=True, exist_ok=True)
     audio = np.concatenate(pieces)
-    sf.write(str(dest), audio, int(sr), format="WAV")
+    sf.write(str(dest), audio, sr, format="WAV")
 
 
 def tts_to_file(tts, text: str, dest: Path, speaker: str, language: str, xtts: bool) -> None:
@@ -210,9 +210,8 @@ def main() -> int:
         return 0
     xtts = is_xtts_model(args.model)
     speaker = Path(args.speaker) if args.speaker else None
-    if xtts:
-        if speaker is None or not speaker.is_file():
-            raise SystemExit("XTTS requires --speaker pointing at a reference WAV")
+    if xtts and (speaker is None or not speaker.is_file()):
+        raise SystemExit("XTTS requires --speaker pointing at a reference WAV")
     speaker_arg = str(speaker) if speaker else ""
 
     jobs: list[dict]
@@ -254,4 +253,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

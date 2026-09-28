@@ -25,8 +25,9 @@ apple_device.bootstrap_mps_fallback()
 
 import numpy as np  # noqa: E402
 import soundfile as sf  # noqa: E402
-from srtutil import cue_seconds, load_srt  # noqa: E402
+
 from czech_tts_text import expand_for_tts  # noqa: E402
+from srtutil import cue_seconds, load_srt  # noqa: E402
 
 BASE_GRAPHEME_FIX = str.maketrans({"ů": "ú", "Ů": "Ú", "ď": "d", "Ď": "D"})
 VITS_MODEL = "tts_models/cs/cv/vits"
@@ -188,7 +189,7 @@ def trim_tts_tail(audio: np.ndarray, sr: int) -> np.ndarray:
         regions.append((start, len(speech)))
     if len(regions) >= 2:
         last_s, last_e = regions[-1]
-        prev_s, prev_e = regions[-2]
+        _, prev_e = regions[-2]
         last_dur = (last_e - last_s) * frame / sr
         gap = (last_s - prev_e) * frame / sr
         if last_dur <= 0.55 and gap >= 0.12 and last_s / max(len(rms), 1) >= 0.55:
@@ -416,7 +417,9 @@ def piper_to_wav(text: str, model: Path, dest: Path) -> None:
     except ImportError:
         piper_bin = shutil.which("piper")
         if not piper_bin:
-            raise SystemExit("piper-tts is not installed and no piper CLI is on PATH")
+            raise SystemExit(
+                "piper-tts is not installed and no piper CLI is on PATH"
+            ) from None
         proc = subprocess.run(
             [piper_bin, "--model", str(model), "--output_file", str(dest)],
             input=text,
@@ -424,7 +427,7 @@ def piper_to_wav(text: str, model: Path, dest: Path) -> None:
             capture_output=True,
         )
         if proc.returncode != 0 or not dest.is_file():
-            raise RuntimeError(f"piper CLI failed: {proc.stderr}")
+            raise RuntimeError(f"piper CLI failed: {proc.stderr}") from None
         return
 
     try:
@@ -562,8 +565,8 @@ def fit_cue_audio(
 
 def fit_cache_tag(cache_id: str, base_speed: float, max_speed: float) -> str:
     return (
-        f"{cache_id}_b{int(round(base_speed * 100)):03d}"
-        f"m{int(round(max_speed * 100)):03d}"
+        f"{cache_id}_b{round(base_speed * 100):03d}"
+        f"m{round(max_speed * 100):03d}"
     )
 
 
@@ -579,10 +582,10 @@ def resample_mono(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 
 
 def overlay(pieces: list[tuple[float, np.ndarray]], duration: float, sr: int) -> np.ndarray:
-    n = max(int(math.ceil(duration * sr)), 1)
+    n = max(math.ceil(duration * sr), 1)
     canvas = np.zeros(n, dtype=np.float32)
     for start_s, samples in pieces:
-        start = int(round(start_s * sr))
+        start = round(start_s * sr)
         if start >= n:
             continue
         end = min(start + len(samples), n)
@@ -740,10 +743,10 @@ def classify_cue_speakers(vocals: Path, cues: list) -> list[dict]:
     for i, r in enumerate(rows):
         if labels[i] == 1:
             continue
-        prev = rows[i - 1]["text"] if i else ""
+        prev_text = rows[i - 1]["text"] if i else ""
         nxt = rows[i + 1]["text"] if i + 1 < len(rows) else ""
         quoted = bool(_QUOTE_START_RE.match(r["text"]))
-        if quoted and (_has_attr(prev) or _has_attr(nxt)):
+        if quoted and (_has_attr(prev_text) or _has_attr(nxt)):
             labels[i] = 1
     for i, r in enumerate(rows):
         if r["dur"] >= 1.2:
@@ -898,7 +901,11 @@ def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(audio))))
 
 
-def f5_infer(tts, ref_audio: Path, ref_text: str, text: str, args, raw: Path, device: str):
+def f5_infer(
+    tts, ref_audio: Path | None, ref_text: str, text: str, args, raw: Path, device: str
+):
+    if ref_audio is None:
+        raise RuntimeError("F5-TTS requires a reference WAV")
     wav, sr, _ = tts.infer(
         ref_file=str(ref_audio),
         ref_text=ref_text,
@@ -943,6 +950,8 @@ def main() -> int:
     using_finetune = engine == "f5"
     if engine == "f5":
         tts, tts_device = load_f5(args)
+        if speaker is None:
+            raise SystemExit("F5 synthesis requires a reference WAV")
         apple_device.log(f"Reference audio={speaker} text={ref_text[:80]!r}")
     elif engine == "xtts":
         if speaker is None:
@@ -967,11 +976,13 @@ def main() -> int:
                 f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
             elif engine in ("xtts", "vits"):
                 coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
-                model = XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+                model_name = (
+                    XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+                )
                 coqui_batch(
                     coqui_python,
                     [{"text": text, "out": str(raw)}],
-                    model,
+                    model_name,
                     speaker if engine == "xtts" else None,
                 )
             else:
@@ -1048,11 +1059,13 @@ def main() -> int:
 
         if pending_coqui:
             coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
-            model = XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+            model_name = (
+                XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+            )
             coqui_batch(
                 coqui_python,
                 pending_coqui,
-                model,
+                model_name,
                 speaker if engine == "xtts" else None,
             )
         for _i, raw, fitted, start, slot in pending_meta:
@@ -1084,4 +1097,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

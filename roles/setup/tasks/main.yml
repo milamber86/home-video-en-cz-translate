@@ -6,34 +6,6 @@
       PyTorch MPS will likely be unavailable under Rosetta or on Intel.
   when: ansible_architecture | default(ansible_machine) != "arm64"
 
-- name: Record module interpreter architecture
-  ansible.builtin.command:
-    argv:
-      - "{{ ansible_python_interpreter }}"
-      - -c
-      - |
-        import json, platform, sys, time
-        from pathlib import Path
-        p = Path("/Users/otto/Cursor_Repos/home-video-en-cz-translate/.cursor/debug-e0bbd4.log")
-        payload = {
-            "sessionId": "e0bbd4",
-            "runId": "post-fix",
-            "hypothesisId": "D",
-            "location": "roles/setup/tasks/main.yml:module_arch",
-            "message": "Ansible module python after wrapper",
-            "data": {
-                "executable": sys.executable,
-                "platform_machine": platform.machine(),
-                "ansible_architecture": "{{ ansible_architecture | default('') }}",
-            },
-            "timestamp": int(time.time() * 1000),
-        }
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.open("a", encoding="utf-8").write(json.dumps(payload) + "\n")
-        print(platform.machine())
-  register: module_arch
-  changed_when: false
-
 - name: Stat Apple Silicon Homebrew
   ansible.builtin.stat:
     path: /opt/homebrew/bin/brew
@@ -230,19 +202,20 @@
     creates: "{{ venv_python }}"
   environment: "{{ brew_env }}"
 
-- name: Install Python dependencies into venv
+- name: Sync Python dependencies into venv from uv.lock
   ansible.builtin.command:
     argv:
       - "{{ brew_bin }}/uv"
-      - pip
-      - install
+      - sync
+      - --frozen
       - --python
-      - "{{ venv_python }}"
-      - -r
-      - "{{ playbook_dir }}/requirements.txt"
-  register: uv_pip
-  changed_when: "'Installed' in (uv_pip.stdout | default('')) or 'Uninstalled' in (uv_pip.stdout | default(''))"
-  environment: "{{ brew_env }}"
+      - "{{ brew_python }}"
+    chdir: "{{ playbook_dir }}"
+  register: uv_sync
+  changed_when: >-
+    'Installed' in (uv_sync.stdout | default(''))
+    or 'Uninstalled' in (uv_sync.stdout | default(''))
+  environment: "{{ brew_env | combine({'UV_PROJECT_ENVIRONMENT': venv_path}) }}"
 
 - name: Create Piper voice directory
   ansible.builtin.file:

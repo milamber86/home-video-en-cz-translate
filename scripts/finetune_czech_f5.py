@@ -63,10 +63,11 @@ def raise_nofile_limit(minimum: int = 8192) -> int:
 
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     inf = getattr(resource, "RLIM_INFINITY", -1)
-    if hard in {inf, -1} or hard > 1_000_000:
-        target = max(soft, minimum)
-    else:
-        target = max(soft, min(minimum, hard))
+    target = (
+        max(soft, minimum)
+        if hard in {inf, -1} or hard > 1_000_000
+        else max(soft, min(minimum, hard))
+    )
     if target > soft:
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
@@ -121,9 +122,8 @@ def patch_load_vocoder() -> str:
 
 def patch_trainer_dataloader() -> int:
     """Force F5's train DataLoader off multiprocessing (avoids EMFILE on epoch 2)."""
-    from torch.utils.data import DataLoader as TorchDataLoader
-
     import f5_tts.model.trainer as trainer_mod
+    from torch.utils.data import DataLoader as TorchDataLoader
 
     workers = dataloader_workers()
 
@@ -168,4 +168,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

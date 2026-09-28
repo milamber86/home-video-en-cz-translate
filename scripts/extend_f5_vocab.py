@@ -72,7 +72,7 @@ def corpus_chars(metadata_csv: Path) -> list[str]:
     seen: set[str] = set()
     with metadata_csv.open(encoding="utf-8-sig", newline="") as fh:
         reader = csv.reader(fh, delimiter="|")
-        header = next(reader, None)
+        next(reader, None)
         for row in reader:
             if len(row) < 2:
                 continue
@@ -160,4 +160,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None
