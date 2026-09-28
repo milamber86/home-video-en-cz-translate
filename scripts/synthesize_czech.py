@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate timed Czech speech from an SRT (Piper, Coqui VITS, or Czech F5)."""
+"""Generate timed Czech speech from an SRT (Pocket TTS, XTTS-v2, Czech F5, Piper, or Coqui VITS)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import wave
 from pathlib import Path
 
@@ -32,6 +33,11 @@ from srtutil import cue_seconds, load_srt  # noqa: E402
 BASE_GRAPHEME_FIX = str.maketrans({"ů": "ú", "Ů": "Ú", "ď": "d", "Ď": "D"})
 VITS_MODEL = "tts_models/cs/cv/vits"
 XTTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+POCKET_CONFIG = (
+    "hf://vvolhejn/pocket-tts-czech/czech.yaml"
+    "@7c1fbd0acba765617749dd17f3dbddc2be791cc7"
+)
+XTTS_RETRY_TEMPERATURE = 0.45
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output czech_vocals.wav")
     p.add_argument("--duration", type=float, help="Video duration seconds (required unless --smoke-test)")
     p.add_argument("--device", default="mps")
-    p.add_argument("--engine", default="auto", choices=("auto", "f5", "xtts", "piper", "vits"))
+    p.add_argument("--engine", default="auto", choices=("auto", "pocket", "f5", "xtts", "piper", "vits"))
     p.add_argument("--voice-mode", choices=("clone", "bundled"), default="clone")
     p.add_argument("--voice-gender", choices=("male", "female"), default="male")
     p.add_argument("--vocals", help="Original vocals.wav for clone mode")
@@ -68,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-rate", type=int, default=48000)
     p.add_argument("--piper-model", default="", help="Piper ONNX voice (cs_CZ-jirka-medium.onnx)")
     p.add_argument("--xtts-python", default="", help="Interpreter for isolated .venv-xtts (VITS/XTTS)")
+    p.add_argument("--pocket-python", default="", help="Interpreter for isolated .venv-pocket (Pocket TTS)")
+    p.add_argument("--pocket-config", default=POCKET_CONFIG, help="Pocket TTS model config (hf:// YAML)")
+    p.add_argument("--pocket-temperature", type=float, default=None, help="Pocket TTS temperature override")
+    p.add_argument("--no-qa", action="store_true", help="Disable per-cue ASR QA (aligned trim + one retry)")
+    p.add_argument("--qa-model", default="", help="Whisper model for cue QA (default: --whisper-model)")
+    p.add_argument("--qa-threshold", type=float, default=0.45, help="CER that triggers one TTS retry")
     p.add_argument("--vits-model", default=VITS_MODEL, help="Coqui Czech VITS model name")
     p.add_argument(
         "--glossary",
@@ -253,6 +265,11 @@ def xtts_pretrained_ready(args: argparse.Namespace) -> bool:
     return (xtts_cache_dir(XTTS_MODEL) / "model.pth").is_file()
 
 
+def pocket_ready(args: argparse.Namespace) -> bool:
+    """True when .venv-pocket exists (weights download on first use)."""
+    return _path_ready(args.pocket_python)
+
+
 def stock_engine(gender: str) -> str:
     return "vits" if gender == "female" else "piper"
 
@@ -266,18 +283,28 @@ def select_engine(args: argparse.Namespace) -> str:
     if gender not in ("male", "female"):
         raise SystemExit(f"Unsupported --voice-gender {args.voice_gender}")
     requested = (args.engine or "auto").strip().lower()
+    if requested == "pocket" and not pocket_ready(args):
+        raise SystemExit(
+            f"engine=pocket requires .venv-pocket with pocket-tts installed; "
+            f"missing interpreter {args.pocket_python or '(unset)'}"
+        )
     if requested == "auto":
         speaker_ok = _path_ready(args.vocals) or _path_ready(args.ref_audio)
+        if pocket_ready(args) and speaker_ok:
+            apple_device.log("TTS auto: Pocket TTS Czech")
+            return "pocket"
         if xtts_pretrained_ready(args) and speaker_ok:
             apple_device.log("TTS auto: pretrained XTTS-v2 (Czech)")
             return "xtts"
         if czech_f5_ready(args):
             apple_device.log(f"TTS auto: Czech F5 checkpoint {args.ckpt}")
             return "f5"
-        if args.voice_mode == "clone" and not xtts_pretrained_ready(args):
+        if args.voice_mode == "clone" and not (
+            pocket_ready(args) or xtts_pretrained_ready(args)
+        ):
             apple_device.log(
-                "voice_mode=clone needs pretrained XTTS-v2 "
-                "(run setup, or tts_engine=f5); falling back to a stock "
+                "voice_mode=clone needs Pocket TTS (.venv-pocket) or pretrained "
+                "XTTS-v2 (run setup, or tts_engine=f5); falling back to a stock "
                 f"{gender} voice"
             )
         return stock_engine(gender)
@@ -312,6 +339,7 @@ def voice_cache_id(engine: str) -> str:
         "vits": "vits_cv",
         "f5": "f5_clone",
         "xtts": "xtts_m2",
+        "pocket": "pocket_cs",
     }.get(engine, engine)
 
 
@@ -496,6 +524,174 @@ def coqui_batch(
         jobs_path.unlink(missing_ok=True)
 
 
+def pocket_batch(
+    pocket_python: Path,
+    jobs: list[dict],
+    config: str,
+    speaker: Path | None = None,
+    temperature: float | None = None,
+) -> None:
+    if not pocket_python.is_file():
+        raise SystemExit(
+            f"Pocket TTS interpreter missing: {pocket_python}. "
+            "Re-run the setup role to create .venv-pocket."
+        )
+    if not jobs:
+        return
+    with tempfile.NamedTemporaryFile(
+        prefix="pocket_jobs_", suffix=".json", delete=False, mode="w", encoding="utf-8"
+    ) as fh:
+        json.dump(jobs, fh, ensure_ascii=False)
+        jobs_path = Path(fh.name)
+    try:
+        cmd = [
+            str(pocket_python),
+            str(SCRIPTS_DIR / "pocket_synth.py"),
+            "--config",
+            config,
+            "--jobs",
+            str(jobs_path),
+        ]
+        if speaker is not None:
+            cmd.extend(["--speaker", str(speaker)])
+        if temperature is not None:
+            cmd.extend(["--temperature", str(temperature)])
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise RuntimeError(f"pocket_synth.py failed ({proc.returncode})")
+    finally:
+        jobs_path.unlink(missing_ok=True)
+
+
+def cue_slot(cue, next_cue) -> float:
+    """Cue duration plus a bounded spill into the silence after it.
+
+    Overlapping only matters when the next cue follows hard on this one; when
+    there is a gap, letting audio run into it is inaudible. Keeps at least
+    `keep_gap` seconds of silence before the next cue.
+    """
+    slot = max(cue_seconds(cue), 0.08)
+    if next_cue is None:
+        return slot
+    gap = (next_cue.start - cue.end).total_seconds()
+    if gap < 0.15:
+        return slot
+    return slot + min(gap * 0.7, gap - 0.1, 2.0)
+
+
+def normalize_for_cer(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "").casefold()
+    return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
+def char_error_rate(ref: str, hyp: str) -> float:
+    ref_n, hyp_n = normalize_for_cer(ref), normalize_for_cer(hyp)
+    if not ref_n:
+        return 0.0 if not hyp_n else 1.0
+    prev = list(range(len(hyp_n) + 1))
+    for i, r in enumerate(ref_n, 1):
+        cur = [i]
+        for j, h in enumerate(hyp_n, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (r != h)))
+        prev = cur
+    return prev[-1] / len(ref_n)
+
+
+def needs_retry(ref: str, hyp: str, threshold: float) -> bool:
+    """Bad transcript (high CER) or an echo signature (extra words)."""
+    ref_n, hyp_n = normalize_for_cer(ref), normalize_for_cer(hyp)
+    if not hyp_n:
+        return True
+    ref_words, hyp_words = ref_n.split(), hyp_n.split()
+    if len(hyp_words) > len(ref_words) * 1.5 + 2:
+        return True
+    return char_error_rate(ref_n, hyp_n) > threshold
+
+
+def trim_by_alignment(audio: np.ndarray, sr: int, words: list[dict], keep_s: float = 0.06):
+    ends = [
+        float(w["end"])
+        for w in words
+        if isinstance(w.get("end"), (int, float)) and math.isfinite(float(w["end"]))
+    ]
+    if not ends:
+        return audio, False
+    cut = min(max(ends) + keep_s, len(audio) / sr)
+    n = int(cut * sr)
+    if n <= 0 or n >= len(audio):
+        return audio, False
+    return fade_out(audio[:n], sr, 0.03), True
+
+
+def qa_asr(path: Path, repo: str) -> dict:
+    import mlx_whisper
+
+    return mlx_whisper.transcribe(
+        str(path), path_or_hf_repo=repo, language="cs", word_timestamps=True
+    )
+
+
+def qa_asr_words(result: dict) -> list[dict]:
+    return [
+        word
+        for seg in result.get("segments", [])
+        for word in (seg.get("words") or [])
+    ]
+
+
+def qa_polish(
+    raw: Path,
+    text: str,
+    args: argparse.Namespace,
+    engine: str,
+    retry=None,
+    log_ctx: str = "",
+) -> Path:
+    """ASR-based per-cue QA: aligned end trim plus one retry on bad output.
+
+    Transcribes the synthesized cue with mlx-whisper, trims everything after
+    the last recognized word (kills appended echo/reference artifacts), and
+    when the transcript is too far from the intended text re-synthesizes once
+    and keeps the better take.
+    """
+    if args.no_qa or engine == "piper":
+        return raw
+    repo = args.qa_model or args.whisper_model
+    try:
+        result = qa_asr(raw, repo)
+    except Exception as exc:
+        apple_device.log(f"QA {log_ctx} unavailable ({exc}); keeping energy trim only")
+        return raw
+    hyp = str(result.get("text", ""))
+    cer = char_error_rate(text, hyp)
+    words = qa_asr_words(result)
+    if needs_retry(text, hyp, args.qa_threshold) and retry is not None:
+        alt = raw.with_name(raw.stem + ".retry.wav")
+        try:
+            retry(alt)
+            retry_result = qa_asr(alt, repo)
+        except Exception as exc:
+            apple_device.log(f"QA {log_ctx} retry failed ({exc})")
+            alt.unlink(missing_ok=True)
+        else:
+            retry_cer = char_error_rate(text, str(retry_result.get("text", "")))
+            if retry_cer < cer:
+                apple_device.log(f"QA {log_ctx} retry improved cer {cer:.2f}->{retry_cer:.2f}")
+                alt.replace(raw)
+                cer = retry_cer
+                result = retry_result
+                words = qa_asr_words(result)
+            else:
+                alt.unlink(missing_ok=True)
+    if words and cer <= 0.5:
+        audio, sr = load_mono(raw)
+        trimmed, changed = trim_by_alignment(audio, sr, words)
+        if changed:
+            sf.write(str(raw), trimmed, sr)
+    apple_device.log(f"QA {log_ctx} cer={cer:.2f} words={len(words)}")
+    return raw
+
+
 def fit_to_slot(
     src: Path,
     dest: Path,
@@ -566,7 +762,7 @@ def fit_cue_audio(
 def fit_cache_tag(cache_id: str, base_speed: float, max_speed: float) -> str:
     return (
         f"{cache_id}_b{round(base_speed * 100):03d}"
-        f"m{round(max_speed * 100):03d}"
+        f"m{round(max_speed * 100):03d}v2"
     )
 
 
@@ -957,6 +1153,10 @@ def main() -> int:
         if speaker is None:
             raise SystemExit("XTTS clone requires a speaker WAV")
         apple_device.log(f"XTTS speaker={speaker}")
+    elif engine == "pocket":
+        if speaker is None:
+            raise SystemExit("Pocket TTS clone requires a speaker WAV")
+        apple_device.log(f"Pocket TTS speaker={speaker} config={args.pocket_config}")
     elif engine == "vits":
         apple_device.log(f"Coqui VITS model={args.vits_model}")
     else:
@@ -974,6 +1174,14 @@ def main() -> int:
             raw = Path(tmp) / "smoke.wav"
             if engine == "f5":
                 f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
+            elif engine == "pocket":
+                pocket_batch(
+                    Path(args.pocket_python),
+                    [{"text": text, "out": str(raw)}],
+                    args.pocket_config,
+                    speaker,
+                    temperature=args.pocket_temperature,
+                )
             elif engine in ("xtts", "vits"):
                 coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
                 model_name = (
@@ -999,7 +1207,7 @@ def main() -> int:
     cues = load_srt(args.srt, sentences=False)
     speaker_for_cue: list[Path] | None = None
     if (
-        engine == "xtts"
+        engine in ("xtts", "pocket")
         and args.voice_mode == "clone"
         and speaker is not None
         and _path_ready(args.vocals)
@@ -1017,7 +1225,7 @@ def main() -> int:
     pieces: list[tuple[float, np.ndarray]] = []
     gen_sr = 24000
     pending_coqui: list[dict] = []
-    pending_meta: list[tuple[int, Path, Path, float, float]] = []
+    pending_meta: list[tuple[int, Path, Path, float, float, str]] = []
 
     with tempfile.TemporaryDirectory(prefix="ttscue_") as tmp:
         tmp_dir = Path(tmp)
@@ -1028,7 +1236,7 @@ def main() -> int:
             text_tag = spoken_cache_tag(text)
             fitted = segments_dir / f"{i:04d}.{fit_tag}.{text_tag}.wav"
             start = cue.start.total_seconds()
-            slot = max(cue_seconds(cue), 0.08)
+            slot = cue_slot(cue, cues[i] if i < len(cues) else None)
             if not args.fresh and usable_segment(fitted):
                 samples, seg_sr = load_mono(fitted)
                 gen_sr = int(seg_sr)
@@ -1037,18 +1245,23 @@ def main() -> int:
                 continue
             raw = segments_dir / f"{i:04d}.{cache_id}.{text_tag}_raw.wav"
             apple_device.log(f"TTS cue {i}/{len(cues)} ({slot:.2f}s): {text[:80]}")
-            if engine in ("xtts", "vits"):
+            if engine in ("xtts", "vits", "pocket"):
                 if usable_segment(raw):
                     apple_device.log(f"TTS cue {i}/{len(cues)} reuse {raw.name}")
                 else:
-                    job = {"text": text, "out": str(raw)}
+                    job: dict = {"text": text, "out": str(raw)}
                     if speaker_for_cue is not None:
                         job["speaker"] = str(speaker_for_cue[i - 1])
                     pending_coqui.append(job)
-                pending_meta.append((i, raw, fitted, start, slot))
+                pending_meta.append((i, raw, fitted, start, slot, text))
                 continue
             if engine == "f5":
+
+                def retry(dest: Path, _text: str = text) -> None:
+                    f5_infer(tts, speaker, ref_text, _text, args, dest, tts_device)
+
                 gen_sr = f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
+                raw = qa_polish(raw, text, args, engine, retry, f"cue {i}/{len(cues)}")
             else:
                 piper_to_wav(text, Path(args.piper_model), raw)
             samples = fit_cue_audio(
@@ -1058,19 +1271,74 @@ def main() -> int:
             pieces.append((start, samples))
 
         if pending_coqui:
-            coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
-            model_name = (
-                XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
-            )
-            coqui_batch(
-                coqui_python,
-                pending_coqui,
-                model_name,
-                speaker if engine == "xtts" else None,
-            )
-        for _i, raw, fitted, start, slot in pending_meta:
+            if engine == "pocket":
+                pocket_batch(
+                    Path(args.pocket_python),
+                    pending_coqui,
+                    args.pocket_config,
+                    speaker,
+                    temperature=args.pocket_temperature,
+                )
+            else:
+                coqui_python = Path(args.xtts_python) if args.xtts_python else Path()
+                model_name = (
+                    XTTS_MODEL if engine == "xtts" else (args.vits_model or VITS_MODEL)
+                )
+                coqui_batch(
+                    coqui_python,
+                    pending_coqui,
+                    model_name,
+                    speaker if engine == "xtts" else None,
+                )
+        for _i, raw, fitted, start, slot, text in pending_meta:
             if not raw.is_file():
-                raise RuntimeError(f"Coqui TTS did not write {raw}")
+                raise RuntimeError(f"TTS driver did not write {raw}")
+            if engine == "pocket":
+                spk = next(
+                    (
+                        job.get("speaker")
+                        for job in pending_coqui
+                        if job["out"] == str(raw)
+                    ),
+                    None,
+                )
+
+                def retry_pocket(
+                    dest: Path, _text: str = text, _spk: str | None = spk
+                ) -> None:
+                    job: dict = {"text": _text, "out": str(dest)}
+                    if _spk:
+                        job["speaker"] = _spk
+                    pocket_batch(
+                        Path(args.pocket_python),
+                        [job],
+                        args.pocket_config,
+                        speaker,
+                        temperature=args.pocket_temperature,
+                    )
+
+                raw = qa_polish(
+                    raw, text, args, engine, retry_pocket, f"cue {_i}/{len(cues)}"
+                )
+            elif engine == "xtts":
+
+                def retry_xtts(dest: Path, _text: str = text) -> None:
+                    coqui_batch(
+                        Path(args.xtts_python) if args.xtts_python else Path(),
+                        [
+                            {
+                                "text": _text,
+                                "out": str(dest),
+                                "temperature": XTTS_RETRY_TEMPERATURE,
+                            }
+                        ],
+                        XTTS_MODEL,
+                        speaker,
+                    )
+
+                raw = qa_polish(
+                    raw, text, args, engine, retry_xtts, f"cue {_i}/{len(cues)}"
+                )
             samples = fit_cue_audio(
                 raw, fitted, slot, max_speed, tmp_dir, base_speed=base_speed
             )

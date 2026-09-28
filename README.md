@@ -2,7 +2,7 @@
 
 Ansible-orchestrated pipeline for Apple Silicon (M2 Ultra). It downloads a YouTube video, separates vocals from the bed, translates English subtitles to Czech (sentence-level), synthesizes timed Czech speech, and remuxes video + background + dubbed voice + Czech SRT.
 
-All AI libraries run in a dedicated Python venv. Ansible itself uses system Python (`connection: local`). Coqui TTS (XTTS-v2 clone, female VITS) uses a second venv (`.venv-xtts`) because Coqui pins an older `transformers` than the main pipeline.
+All AI libraries run in a dedicated Python venv. Ansible itself uses system Python (`connection: local`). Coqui TTS (XTTS-v2 clone baseline, female VITS) uses a second venv (`.venv-xtts`) because Coqui pins an older `transformers` than the main pipeline; Pocket TTS Czech (the default clone engine) uses a third (`.venv-pocket`).
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ Useful extra-vars:
 |---|---|---|
 | `voice_mode` | `clone` | Clone the source speaker. `auto` uses pretrained XTTS-v2 when those weights are cached. `bundled` is stock Piper/VITS (or Czech F5 if you set `tts_engine=f5` and add `files/voices/czech_default_ref.wav`). |
 | `tts_voice_gender` | `male` | `male` = Piper `cs_CZ-jirka-medium`. `female` = Coqui `tts_models/cs/cv/vits`. Ignored for XTTS clone. |
-| `tts_engine` | `auto` | Prefers pretrained XTTS-v2 (Czech included) when `model.pth` is cached. Else Czech F5 if `models/f5_czech` exists. Else Piper/VITS by gender. |
+| `tts_engine` | `auto` | Prefers Pocket TTS Czech when `.venv-pocket` exists and a reference is available; then pretrained XTTS-v2 when `model.pth` is cached (comparison baseline). Else Czech F5 if `models/f5_czech` exists. Else Piper/VITS by gender. |
 | `speaker_gender` | `auto` | Narrator gender for Czech agreement. `auto` infers from the transcript, then from `vocals.wav` pitch. Override with `male` or `female` |
 | `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist. Reuses `subs/whisper.en.srt` unless you delete it or pass `--force-asr` |
 | `force_tts` | `false` | Redo Czech vocals (wipes `tts/segments`) and remux |
@@ -100,14 +100,17 @@ Official F5-TTS (`F5TTS_v1_Base`) is Chinese+English only and is **not** used fo
 
 | Condition | Engine |
 |---|---|
-| Pretrained XTTS-v2 cached (`~/Library/Application Support/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth`) | XTTS-v2 clones the narrator from a clean vocal clip; guest lines use that line’s vocals (or a guest ref) |
-| No XTTS weights, Czech F5 checkpoint in `models/f5_czech` | Fine-tuned Czech F5. Clear with a Czech reference; English `vocals.wav` as the prompt is mostly unintelligible |
-| Neither of the above, `tts_voice_gender=male` | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
+| `.venv-pocket` exists (setup creates it) and a reference is available | **Pocket TTS Czech** (Kyutai, `vvolhejn/pocket-tts-czech`) — 100M-param cloning model, faster than realtime on CPU, MIT/CC-BY-4.0 |
+| Pocket venv absent, pretrained XTTS-v2 cached (`~/Library/Application Support/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth`) | XTTS-v2 clones the narrator from a clean vocal clip; guest lines use that line’s vocals (or a guest ref). Kept as the comparison baseline |
+| No Pocket/XTTS weights, Czech F5 checkpoint in `models/f5_czech` | Fine-tuned Czech F5. Clear with a Czech reference; English `vocals.wav` as the prompt is mostly unintelligible |
+| None of the above, `tts_voice_gender=male` | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
 | `tts_voice_gender=female` | Coqui Czech Common Voice VITS (`tts_models/cs/cv/vits`) in `.venv-xtts` |
 
-Setup prefetches XTTS-v2. Force F5 with `-e tts_engine=f5`. There is no official female Piper Czech voice. VITS is weaker than Jirka.
+Setup prefetches Pocket TTS weights into `models/pocket/` and XTTS-v2. Force an engine with `-e tts_engine=pocket` (or `xtts`, `f5`, `piper`, `vits`). There is no official female Piper Czech voice. VITS is weaker than Jirka.
 
-XTTS tails are trimmed (trailing silence and the short echo burst the model often appends). Every cue is time-stretched by `tts_base_speed` (default 1.15×) so Czech can keep up with English; a line that still overruns only goes up to `tts_max_speed` (1.25×). Clone refs stay inside each cue’s timestamps (no 4s bleed into the next speaker). Narrator lines share one ref; guest lines use that guest’s audio.
+Every cue gets ASR-based QA (mlx-whisper, same model as the transcription step): the synthesized audio is transcribed, everything after the last recognized word is cut (kills appended echo/reference artifacts), and a cue whose transcript strays too far from the intended text (`--qa-threshold`, default CER 0.45) is re-synthesized once, keeping the better take. Disable with `tts_qa=false` or `--no-qa`. XTTS tails additionally get the energy-based trim (trailing silence and the short echo burst the model often appends). Pocket TTS is a sentence-level model and is driven one sentence per call.
+
+Every cue is time-stretched by `tts_base_speed` (default 1.15×) so Czech can keep up with English; a line that still overruns only goes up to `tts_max_speed` (1.25×). Before any speedup is applied, a cue whose next neighbor leaves silence may spill into that gap (up to 70% of it), so most cues play at natural pace without overlapping the next line. Clone refs stay inside each cue’s timestamps (no 4s bleed into the next speaker). Narrator lines share one ref; guest lines use that guest’s audio.
 
 ## Czech F5-TTS (optional, hours-long)
 
@@ -117,7 +120,7 @@ Fine-tune from `F5TTS_v1_Base` (never from scratch):
 ansible-playbook train_czech_tts.yml -K
 ```
 
-Defaults: VoxPopuli Czech (`facebook/voxpopuli`, config `cs`; ~62 transcribed hours), 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.pt` is used only when pretrained XTTS-v2 is missing or you set `tts_engine=f5`.
+Defaults: VoxPopuli Czech (`facebook/voxpopuli`, config `cs`; ~62 transcribed hours), 20 hours of 1–12 s clips, **CPU** training (MPS training is opt-in and can produce silent audio). Overnight-scale on M2 Ultra. After success, `models/f5_czech/model_last.pt` is used in `auto` only when Pocket TTS and pretrained XTTS-v2 are unavailable, or always when you set `tts_engine=f5`.
 
 Mozilla Common Voice is no longer hosted on Hugging Face (Mozilla Data Collective as of October 2025). To train on a CV tarball you downloaded yourself, unpack it to `metadata.csv` + `wavs/` and pass `-e f5_train_local_dir=/path/to/that/dir`.
 
@@ -137,7 +140,7 @@ ansible-playbook site.yml --skip-tags setup,ollama,download,demucs \
 
 - `PYTORCH_ENABLE_MPS_FALLBACK=1` is set before any `import torch`.
 - Demucs, Marian, and Czech F5 inference use `torch.device("mps")` when available.
-- Coqui XTTS-v2 (default clone) and VITS run on CPU in `.venv-xtts`.
+- Pocket TTS Czech (default clone) runs on CPU in `.venv-pocket`; Coqui XTTS-v2 (baseline) and VITS run on CPU in `.venv-xtts`.
 - Whisper uses **mlx-whisper** on Metal (`mlx-community/whisper-large-v3-mlx`). `openai-whisper` + MPS is unreliable; `faster-whisper` is CPU-only on Mac.
 
 ## Layout
@@ -150,6 +153,8 @@ work/<id>/      Per-video artifacts
 models/piper/   Piper cs_CZ-jirka-medium (gitignored)
 models/f5_czech/  Trained Czech F5 checkpoint (gitignored)
 .venv-xtts/     Isolated Coqui env for XTTS-v2 and VITS (gitignored)
+.venv-pocket/   Isolated Kyutai Pocket TTS env (gitignored)
+models/pocket/  Pocket TTS prefetch marker (gitignored)
 ```
 
 ## Development

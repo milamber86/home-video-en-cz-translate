@@ -19,13 +19,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("COQUI_TOS_AGREED", "1")
+
+from text_split import split_cs_chunks
 
 # XTTS tokenizer warns/truncates Czech above this many characters.
 XTTS_CS_CHAR_LIMIT = 180
@@ -70,43 +71,6 @@ def patch_czech_ordinals() -> None:
     tok._expand_ordinal = _expand_ordinal
 
 
-def split_cs_chunks(text: str, limit: int) -> list[str]:
-    text = re.sub(r"\s+", " ", (text or "").strip())
-    if not text:
-        return []
-    if len(text) <= limit:
-        return [text]
-    parts = [p.strip() for p in re.split(r"(?<=[;:,.!?…])\s+", text) if p.strip()]
-    chunks: list[str] = []
-    buf = ""
-    for part in parts:
-        pieces = [part] if len(part) <= limit else _split_words(part, limit)
-        for piece in pieces:
-            if buf and len(buf) + 1 + len(piece) > limit:
-                chunks.append(buf)
-                buf = piece
-            else:
-                buf = f"{buf} {piece}".strip()
-    if buf:
-        chunks.append(buf)
-    return chunks
-
-
-def _split_words(text: str, limit: int) -> list[str]:
-    words = text.split()
-    out: list[str] = []
-    buf = ""
-    for word in words:
-        if buf and len(buf) + 1 + len(word) > limit:
-            out.append(buf)
-            buf = word
-        else:
-            buf = f"{buf} {word}".strip()
-    if buf:
-        out.append(buf)
-    return out
-
-
 def load_tts(model_name: str):
     from TTS.api import TTS
 
@@ -143,7 +107,16 @@ def _concat_wavs(paths: list[Path], dest: Path) -> None:
     sf.write(str(dest), audio, sr, format="WAV")
 
 
-def tts_to_file(tts, text: str, dest: Path, speaker: str, language: str, xtts: bool) -> None:
+def tts_to_file(
+    tts,
+    text: str,
+    dest: Path,
+    speaker: str,
+    language: str,
+    xtts: bool,
+    temperature: float | None = None,
+    repetition_penalty: float | None = None,
+) -> None:
     kwargs = {
         "text": text,
         "file_path": str(dest),
@@ -154,16 +127,28 @@ def tts_to_file(tts, text: str, dest: Path, speaker: str, language: str, xtts: b
         kwargs["language"] = language
         kwargs["split_sentences"] = False
         # Lower temperature / higher repetition penalty cut the end-of-line
-        # echo and leftover-reference artifacts XTTS often appends.
-        kwargs["temperature"] = 0.65
+        # echo and leftover-reference artifacts XTTS often appends. Jobs may
+        # override both for the QA retry pass.
+        kwargs["temperature"] = 0.65 if temperature is None else float(temperature)
         kwargs["length_penalty"] = 1.0
-        kwargs["repetition_penalty"] = 10.0
+        kwargs["repetition_penalty"] = (
+            10.0 if repetition_penalty is None else float(repetition_penalty)
+        )
         kwargs["top_k"] = 50
         kwargs["top_p"] = 0.8
     tts.tts_to_file(**kwargs)
 
 
-def synth_one(tts, text: str, speaker: str, out: str, language: str, xtts: bool) -> None:
+def synth_one(
+    tts,
+    text: str,
+    speaker: str,
+    out: str,
+    language: str,
+    xtts: bool,
+    temperature: float | None = None,
+    repetition_penalty: float | None = None,
+) -> None:
     text = (text or "").strip()
     if not text:
         raise SystemExit("Empty text")
@@ -176,7 +161,10 @@ def synth_one(tts, text: str, speaker: str, out: str, language: str, xtts: bool)
     # Keep a .wav suffix so SoundFile/Coqui can infer the container.
     partial = dest.with_name(dest.stem + ".partial.wav")
     if len(chunks) == 1:
-        tts_to_file(tts, chunks[0], partial, speaker, language, xtts)
+        tts_to_file(
+            tts, chunks[0], partial, speaker, language, xtts,
+            temperature=temperature, repetition_penalty=repetition_penalty,
+        )
         partial.replace(dest)
         return
     with tempfile.TemporaryDirectory(prefix="coqui_chunks_") as tmp:
@@ -185,7 +173,10 @@ def synth_one(tts, text: str, speaker: str, out: str, language: str, xtts: bool)
         for i, chunk in enumerate(chunks, start=1):
             part = tmp_dir / f"{i:02d}.wav"
             print(f"  chunk {i}/{len(chunks)} ({len(chunk)} chars)", file=sys.stderr, flush=True)
-            tts_to_file(tts, chunk, part, speaker, language, xtts)
+            tts_to_file(
+                tts, chunk, part, speaker, language, xtts,
+                temperature=temperature, repetition_penalty=repetition_penalty,
+            )
             parts.append(part)
         _concat_wavs(parts, partial)
     partial.replace(dest)
@@ -245,7 +236,16 @@ def main() -> int:
         if xtts and not this_speaker:
             raise SystemExit(f"Job {i} missing speaker WAV")
         print(f"Coqui {i}/{len(jobs)} -> {out}", file=sys.stderr, flush=True)
-        synth_one(tts, text, this_speaker, out, args.language, xtts)
+        synth_one(
+            tts,
+            text,
+            this_speaker,
+            out,
+            args.language,
+            xtts,
+            temperature=job.get("temperature"),
+            repetition_penalty=job.get("repetition_penalty"),
+        )
     return 0
 
 

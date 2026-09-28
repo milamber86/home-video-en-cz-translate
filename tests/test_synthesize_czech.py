@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import shutil
+from datetime import timedelta
 
 import numpy as np
 import pytest
 import soundfile as sf
+import srt
 
 import synthesize_czech as sc
 
@@ -43,7 +46,7 @@ def test_voice_cache_id_and_stock_engine():
 
 
 def test_fit_cache_tag():
-    assert sc.fit_cache_tag("xtts_m2", 1.15, 1.25) == "xtts_m2_b115m125"
+    assert sc.fit_cache_tag("xtts_m2", 1.15, 1.25) == "xtts_m2_b115m125v2"
 
 
 def test_spoken_cache_tag_deterministic():
@@ -154,3 +157,130 @@ def test_fit_to_slot_stretches_to_slot(tmp_path):
     dur = len(audio) / sr
     assert dest.is_file()
     assert 0.78 <= dur <= 0.84
+
+
+def _srt_cue(start: float, end: float, text: str = "x") -> srt.Subtitle:
+    return srt.Subtitle(
+        index=1,
+        start=timedelta(seconds=start),
+        end=timedelta(seconds=end),
+        content=text,
+    )
+
+
+def test_cue_slot_no_spill_when_back_to_back():
+    cue = _srt_cue(0.0, 2.0)
+    nxt = _srt_cue(2.0, 4.0)
+    assert sc.cue_slot(cue, nxt) == pytest.approx(2.0)
+
+
+def test_cue_slot_spills_into_gap():
+    cue = _srt_cue(0.0, 2.0)
+    nxt = _srt_cue(4.0, 6.0)
+    slot = sc.cue_slot(cue, nxt)
+    assert 2.0 < slot <= 2.0 + 0.7 * 2.0 + 1e-6
+    assert slot <= 4.0 - 0.1
+
+
+def test_cue_slot_no_next_cue():
+    cue = _srt_cue(0.0, 2.0)
+    assert sc.cue_slot(cue, None) == pytest.approx(2.0)
+
+
+def test_cue_slot_caps_huge_gap():
+    cue = _srt_cue(0.0, 2.0)
+    nxt = _srt_cue(30.0, 32.0)
+    assert sc.cue_slot(cue, nxt) == pytest.approx(4.0)
+
+
+def test_voice_cache_id_pocket():
+    assert sc.voice_cache_id("pocket") == "pocket_cs"
+    assert sc.voice_cache_id("xtts") == "xtts_m2"
+
+
+def test_normalize_for_cer():
+    assert sc.normalize_for_cer("Dobrý den, světe!") == "dobrý den světe"
+    assert sc.normalize_for_cer("") == ""
+
+
+def test_char_error_rate():
+    assert sc.char_error_rate("kocka", "kocka") == 0.0
+    assert sc.char_error_rate("kocka", "koka") == pytest.approx(1 / 5)
+    assert sc.char_error_rate("", "") == 0.0
+    assert sc.char_error_rate("", "x") == 1.0
+    assert sc.char_error_rate("Dobrý den", "dobrý den") == 0.0
+
+
+def test_needs_retry():
+    assert not sc.needs_retry("ahoj světe", "ahoj světe.", 0.45)
+    assert sc.needs_retry("ahoj světe", "", 0.45)
+    assert sc.needs_retry("ahoj světe", "úplně nesouvisející slova", 0.45)
+    assert sc.needs_retry("ahoj", "ahoj ahoj ahoj ahoj ahoj ahoj ahoj", 0.45)
+
+
+def test_trim_by_alignment():
+    sr = 100
+    audio = np.ones(1000, dtype=np.float32)
+    trimmed, changed = sc.trim_by_alignment(audio, sr, [{"end": 3.0}])
+    assert changed
+    assert len(trimmed) == 306
+    same, changed = sc.trim_by_alignment(audio, sr, [])
+    assert not changed
+    assert len(same) == 1000
+
+
+def test_select_engine_prefers_pocket(tmp_path):
+    fake_python = tmp_path / "python"
+    fake_python.write_text("#!/bin/sh\n")
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"RIFF")
+    args = argparse.Namespace(
+        engine="auto",
+        voice_gender="male",
+        voice_mode="clone",
+        vocals=None,
+        ref_audio=str(ref),
+        pocket_python=str(fake_python),
+        pocket_config=sc.POCKET_CONFIG,
+        xtts_python="",
+        ckpt="",
+        vocab="",
+    )
+    assert sc.select_engine(args) == "pocket"
+
+
+def test_select_engine_falls_back_without_pocket(tmp_path):
+    args = argparse.Namespace(
+        engine="auto",
+        voice_gender="male",
+        voice_mode="clone",
+        vocals=None,
+        ref_audio=None,
+        pocket_python="",
+        pocket_config=sc.POCKET_CONFIG,
+        xtts_python="",
+        ckpt="",
+        vocab="",
+    )
+    assert sc.select_engine(args) == "piper"
+
+
+def test_select_engine_rejects_explicit_pocket_without_venv(tmp_path):
+    args = argparse.Namespace(
+        engine="pocket",
+        voice_gender="male",
+        voice_mode="clone",
+        vocals=None,
+        ref_audio=None,
+        pocket_python=str(tmp_path / "missing"),
+        pocket_config=sc.POCKET_CONFIG,
+        xtts_python="",
+        ckpt="",
+        vocab="",
+    )
+    try:
+        sc.select_engine(args)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("pocket without .venv-pocket must raise")

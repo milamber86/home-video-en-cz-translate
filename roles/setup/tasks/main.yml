@@ -291,6 +291,48 @@
   async: 3600
   poll: 15
 
+- name: Create Pocket TTS virtualenv
+  ansible.builtin.command:
+    argv:
+      - "{{ brew_bin }}/uv"
+      - venv
+      - "{{ pocket_venv }}"
+      - --python
+      - "{{ brew_python }}"
+    creates: "{{ pocket_python }}"
+  environment: "{{ brew_env }}"
+
+- name: Install Pocket TTS into isolated venv
+  ansible.builtin.command:
+    argv:
+      - "{{ brew_bin }}/uv"
+      - pip
+      - install
+      - --python
+      - "{{ pocket_python }}"
+      - "{{ pocket_tts_pkg }}"
+      - soundfile
+  register: uv_pip_pocket
+  changed_when: >-
+    'Installed' in (uv_pip_pocket.stdout | default(''))
+    or 'Uninstalled' in (uv_pip_pocket.stdout | default(''))
+  environment: "{{ brew_env }}"
+
+- name: Prefetch Pocket TTS Czech model weights
+  ansible.builtin.command:
+    argv:
+      - "{{ pocket_python }}"
+      - "{{ scripts_dir }}/pocket_synth.py"
+      - --config
+      - "{{ pocket_config }}"
+      - --prefetch
+      - --prefetch-marker
+      - "{{ playbook_dir }}/models/pocket/prefetched"
+    creates: "{{ playbook_dir }}/models/pocket/prefetched"
+  environment: "{{ brew_env }}"
+  async: 1800
+  poll: 15
+
 - name: Verify ffmpeg
   ansible.builtin.command:
     argv:

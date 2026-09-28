@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import xtts_synth as xs
+from text_split import _split_words, split_sentences
 
 
 def test_is_xtts_model():
@@ -39,5 +40,11 @@ def test_split_cs_chunks_long_single_word_kept():
 
 
 def test_split_words():
-    assert xs._split_words("aaa bbb ccc", 7) == ["aaa bbb", "ccc"]
-    assert xs._split_words("ab cd", 10) == ["ab cd"]
+    assert _split_words("aaa bbb ccc", 7) == ["aaa bbb", "ccc"]
+    assert _split_words("ab cd", 10) == ["ab cd"]
+
+
+def test_split_sentences():
+    assert split_sentences("První. Druhá! Třetí?") == ["První.", "Druhá!", "Třetí?"]
+    assert split_sentences("Bez tečky") == ["Bez tečky"]
+    assert split_sentences("") == []

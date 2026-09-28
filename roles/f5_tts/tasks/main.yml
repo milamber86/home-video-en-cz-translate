@@ -78,14 +78,15 @@
   ansible.builtin.debug:
     msg: >-
       TTS engine={{ tts_engine }} voice_mode={{ voice_mode }}.
-      auto uses pretrained XTTS-v2 (Czech) when the Coqui weights are cached.
+      auto uses Pocket TTS Czech when .venv-pocket exists, then pretrained
+      XTTS-v2 (Czech) when the Coqui weights are cached.
       {% if f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists %}
       Czech F5 checkpoint {{ f5_ckpt_file }} is used only if tts_engine=f5.
       {% endif %}
 
 - name: Synthesize timed Czech speech
   ansible.builtin.command:
-    argv: "{{ tts_args + tts_ckpt_args + tts_fresh_args + tts_bundled_ref_args }}"
+    argv: "{{ tts_args + tts_ckpt_args + tts_fresh_args + tts_bundled_ref_args + tts_pocket_args + tts_qa_args }}"
   vars:
     tts_args:
       - "{{ venv_python }}"
@@ -129,6 +130,8 @@
     tts_ckpt_args: "{{ ['--ckpt', f5_ckpt_file, '--vocab', f5_ckpt_dir ~ '/vocab.txt'] if (f5_ckpt_file | length > 0 and f5_vocab_stat.stat.exists) else [] }}"
     tts_fresh_args: "{{ ['--fresh'] if (tts_fresh | default(false) | bool) else [] }}"
     tts_bundled_ref_args: "{{ ['--ref-audio', voice_ref_wav, '--ref-text', voice_ref_text] if voice_mode == 'bundled' else [] }}"
+    tts_pocket_args: "{{ ['--pocket-python', pocket_python, '--pocket-config', pocket_config] if (pocket_python | default('') is file) else [] }}"
+    tts_qa_args: "{{ ['--no-qa'] if not (tts_qa | default(true) | bool) else [] }}"
   environment: "{{ pytorch_env }}"
   register: tts_synth
   failed_when: tts_synth.rc != 0

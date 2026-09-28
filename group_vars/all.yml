@@ -53,14 +53,23 @@ piper_voice_dir: "{{ playbook_dir }}/models/piper"
 piper_voice: cs_CZ-jirka-medium
 piper_voice_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/cs/cs_CZ/jirka/medium
 
-# Coqui lives in an isolated venv (old transformers). XTTS-v2 is the default cloner.
+# Coqui lives in an isolated venv (old transformers). XTTS-v2 is kept as the
+# comparison baseline; auto prefers Pocket TTS Czech below.
 xtts_venv: "{{ playbook_dir }}/.venv-xtts"
 xtts_python: "{{ xtts_venv }}/bin/python"
 xtts_model: tts_models/multilingual/multi-dataset/xtts_v2
 tts_vits_model: tts_models/cs/cv/vits
 
-# Voice / TTS. auto uses pretrained XTTS-v2 (Czech included) when model.pth is cached.
-# Czech F5 is opt-in: tts_engine=f5.
+# Pocket TTS (Kyutai) — default Czech cloner. Sentence-level model: the driver
+# synthesizes sentence-by-sentence because the model emits EOS after one.
+pocket_venv: "{{ playbook_dir }}/.venv-pocket"
+pocket_python: "{{ pocket_venv }}/bin/python"
+pocket_tts_pkg: pocket-tts>=3.0
+pocket_config: "hf://vvolhejn/pocket-tts-czech/czech.yaml@7c1fbd0acba765617749dd17f3dbddc2be791cc7"
+
+# Voice / TTS. auto prefers Pocket TTS Czech (when .venv-pocket exists and a
+# reference is available), then pretrained XTTS-v2, then Czech F5 (opt-in via
+# tts_engine=f5), then a stock Piper/VITS voice.
 voice_mode: clone
 tts_voice_gender: male
 voice_ref_wav: "{{ playbook_dir }}/files/voices/czech_default_ref.wav"
@@ -69,8 +78,11 @@ f5_model: F5TTS_v1_Base
 f5_nfe_step: 32
 # Every cue is sped by tts_base_speed. Overflow only goes up to tts_max_speed
 # so Czech can fit English slots without large sentence-to-sentence jumps.
+# Cues with silence after them may spill into that gap before any speedup.
 tts_base_speed: 1.15
 tts_max_speed: 1.25
+# Per-cue ASR QA (mlx-whisper): aligned end trim + one retry on bad output.
+tts_qa: true
 f5_ckpt_dir: "{{ playbook_dir }}/models/f5_czech"
 tts_engine: auto
 
