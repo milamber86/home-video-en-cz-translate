@@ -42,10 +42,12 @@ Useful extra-vars:
 | `tts_voice_gender` | `male` | `male` = Piper `cs_CZ-jirka-medium`. `female` = Coqui `tts_models/cs/cv/vits`. Ignored for XTTS clone. |
 | `tts_engine` | `auto` | Prefers pretrained XTTS-v2 (Czech included) when `model.pth` is cached. Else Czech F5 if `models/f5_czech` exists. Else Piper/VITS by gender. |
 | `speaker_gender` | `auto` | Narrator gender for Czech agreement. `auto` infers from the transcript, then from `vocals.wav` pitch. Override with `male` or `female` |
-| `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist |
+| `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist. Reuses `subs/whisper.en.srt` unless you delete it or pass `--force-asr` |
 | `force_tts` | `false` | Redo Czech vocals (wipes `tts/segments`) and remux |
 | `output_container` | `mkv` | `mkv` (native SRT) or `mp4` (`mov_text`) |
 | `ollama_model` | `translategemma:12b` | Pulled by the `ollama` role. Dedicated EN→CS. `translategemma:27b` is stronger; `qwen2.5:14b` is a general-chat fallback |
+| `tts_base_speed` | `1.15` | Minimum pace for every Czech cue (Czech is longer than English) |
+| `tts_max_speed` | `1.25` | Cap when a cue still overruns its English slot. Keep close to `tts_base_speed` to avoid jumps |
 | `ytdlp_cookies_from_browser` | `""` | e.g. `chrome` if YouTube returns 429 or 403 even with Deno |
 
 Tags: `setup`, `ollama`, `download`, `demucs`, `whisper_translate`, `f5_tts`, `remux`.
@@ -82,7 +84,7 @@ Output lands in `work/<youtube_id>/output/<youtube_id>.cs.mkv` (or `.mp4`).
 
 ## Translation
 
-English cues are packed into **complete sentences** (YouTube rolling captions are unrolled first). Speaker gender is inferred (`auto`: vocals pitch first, then the transcript if it has a clear quote) and passed into every translate prompt so Czech first-person agreement stays feminine or masculine. Override with `-e speaker_gender=female` or `male`. At TTS time, numbers and abbreviations are expanded into spoken Czech. If Ollama is down or a general-chat model returns bad JSON, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
+English comes from **mlx-whisper on `vocals.wav` only** (cached as `subs/whisper.en.srt`). YouTube captions are not merged; they were shifting times and mixing speakers. Leftover karaoke repeats are still dropped. Speaker gender is inferred (`auto`: vocals pitch first, then the transcript if it has a clear quote) and passed into every translate prompt so Czech first-person agreement stays feminine or masculine. Override with `-e speaker_gender=female` or `male`. At TTS time, numbers and abbreviations are expanded into spoken Czech. If Ollama is down or a general-chat model returns bad JSON, it falls back to Marian (`Helsinki-NLP/opus-mt-tc-big-en-ces_slk`) on MPS.
 
 The default translator is [TranslateGemma](https://ai.google.dev/gemma/docs/translategemma/model-card) 12B (~8 GB): dedicated EN→CS, official plain-text prompt, one cue at a time with a short previous-line context and the detected speaker gender. `translategemma:27b` is stronger (~17 GB). `qwen2.5:14b` is a general-chat fallback (`-e ollama_model=qwen2.5:14b`). A second rewrite pass is not used: it made the Czech more literal.
 
@@ -98,12 +100,14 @@ Official F5-TTS (`F5TTS_v1_Base`) is Chinese+English only and is **not** used fo
 
 | Condition | Engine |
 |---|---|
-| Pretrained XTTS-v2 cached (`~/Library/Application Support/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth`) | XTTS-v2 clones `vocals.wav` into Czech (`tts_engine=auto`) |
+| Pretrained XTTS-v2 cached (`~/Library/Application Support/tts/tts_models--multilingual--multi-dataset--xtts_v2/model.pth`) | XTTS-v2 clones the narrator from a clean vocal clip; guest lines use that line’s vocals (or a guest ref) |
 | No XTTS weights, Czech F5 checkpoint in `models/f5_czech` | Fine-tuned Czech F5. Clear with a Czech reference; English `vocals.wav` as the prompt is mostly unintelligible |
 | Neither of the above, `tts_voice_gender=male` | Piper `cs_CZ-jirka-medium` (setup downloads the ONNX into `models/piper/`) |
 | `tts_voice_gender=female` | Coqui Czech Common Voice VITS (`tts_models/cs/cv/vits`) in `.venv-xtts` |
 
 Setup prefetches XTTS-v2. Force F5 with `-e tts_engine=f5`. There is no official female Piper Czech voice. VITS is weaker than Jirka.
+
+XTTS tails are trimmed (trailing silence and the short echo burst the model often appends). Every cue is time-stretched by `tts_base_speed` (default 1.15×) so Czech can keep up with English; a line that still overruns only goes up to `tts_max_speed` (1.25×). Clone refs stay inside each cue’s timestamps (no 4s bleed into the next speaker). Narrator lines share one ref; guest lines use that guest’s audio.
 
 ## Czech F5-TTS (optional, hours-long)
 

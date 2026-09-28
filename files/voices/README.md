@@ -10,9 +10,11 @@ video, place two files here:
 1. `czech_default_ref.wav` — 5–12 seconds of clean, mono-or-stereo speech, ~24 kHz or 48 kHz PCM/WAV. Leave a short trailing silence.
 2. `czech_default_ref.txt` — exact transcript of that clip (UTF-8). Do not leave it empty; F5-TTS otherwise loads a second Whisper model.
 
-Clone-from-original (`voice_mode=clone`) uses pretrained XTTS-v2 plus a clip from
-`vocals.wav`. If you force `tts_engine=f5` in clone mode, the clip is transcribed
-with Whisper (do not point `--ref-text` at `czech_default_ref.txt`). Without
-cached XTTS weights, clone falls back to Czech F5 if present, else Piper/VITS.
+Clone-from-original (`voice_mode=clone`) uses pretrained XTTS-v2. Narrator
+lines share one voiced clip from `vocals.wav`. Guest lines clone from that
+line’s vocals (or a concatenated guest ref). If you force `tts_engine=f5` in clone
+mode, the narrator clip is transcribed with Whisper (do not point `--ref-text`
+at `czech_default_ref.txt`). Without cached XTTS weights, clone falls back to
+Czech F5 if present, else Piper/VITS.
 
 Do not commit copyrighted voice recordings.

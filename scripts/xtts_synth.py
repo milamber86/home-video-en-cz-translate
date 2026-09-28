@@ -10,7 +10,7 @@ Czech VITS stock voice (no speaker):
 
 Batch (loads the model once):
   xtts_synth.py --model ... --jobs jobs.json
-  jobs.json is a list of {"text": "...", "out": "path.wav"}
+  jobs.json is a list of {"text": "...", "out": "path.wav", "speaker": "optional.wav"}
 Existing out files are skipped so a crash can be resumed.
 """
 
@@ -125,12 +125,16 @@ def _concat_wavs(paths: list[Path], dest: Path) -> None:
 
     pieces = []
     sr = None
+    gap = None
     for path in paths:
         audio, this_sr = sf.read(str(path), always_2d=False)
         if sr is None:
             sr = this_sr
+            gap = np.zeros(max(int(0.08 * sr), 1), dtype=np.float32)
         elif this_sr != sr:
             raise RuntimeError(f"Sample-rate mismatch {this_sr} vs {sr}")
+        if pieces and gap is not None:
+            pieces.append(gap)
         pieces.append(np.asarray(audio, dtype=np.float32))
     if not pieces:
         raise RuntimeError("No Coqui chunks to concatenate")
@@ -149,6 +153,13 @@ def tts_to_file(tts, text: str, dest: Path, speaker: str, language: str, xtts: b
         kwargs["speaker_wav"] = speaker
         kwargs["language"] = language
         kwargs["split_sentences"] = False
+        # Lower temperature / higher repetition penalty cut the end-of-line
+        # echo and leftover-reference artifacts XTTS often appends.
+        kwargs["temperature"] = 0.65
+        kwargs["length_penalty"] = 1.0
+        kwargs["repetition_penalty"] = 10.0
+        kwargs["top_k"] = 50
+        kwargs["top_p"] = 0.8
     tts.tts_to_file(**kwargs)
 
 
@@ -230,8 +241,12 @@ def main() -> int:
 
     tts = load_tts(args.model)
     for i, text, out in pending:
+        job = jobs[i - 1]
+        this_speaker = str(job.get("speaker") or speaker_arg)
+        if xtts and not this_speaker:
+            raise SystemExit(f"Job {i} missing speaker WAV")
         print(f"Coqui {i}/{len(jobs)} -> {out}", file=sys.stderr, flush=True)
-        synth_one(tts, text, speaker_arg, out, args.language, xtts)
+        synth_one(tts, text, this_speaker, out, args.language, xtts)
     return 0
 
 

@@ -12,7 +12,29 @@
     - "{{ job_dir }}/tts/segments"
   when: force_tts | default(false) | bool
 
+- name: Stat Czech SRT for TTS freshness
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/subs/cs.srt"
+  register: cs_srt_for_tts
+
 - name: Check existing Czech vocals
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/tts/czech_vocals.wav"
+  register: czech_vocals
+
+- name: Remove Czech vocals when the translation is newer
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ job_dir }}/tts/czech_vocals.wav"
+    - "{{ job_dir }}/tts/segments"
+  when:
+    - czech_vocals.stat.exists
+    - cs_srt_for_tts.stat.exists
+    - cs_srt_for_tts.stat.mtime > czech_vocals.stat.mtime
+
+- name: Recheck Czech vocals after stale wipe
   ansible.builtin.stat:
     path: "{{ job_dir }}/tts/czech_vocals.wav"
   register: czech_vocals
@@ -90,6 +112,8 @@
       - "{{ f5_model }}"
       - --nfe-step
       - "{{ f5_nfe_step | string }}"
+      - --base-speed
+      - "{{ tts_base_speed | string }}"
       - --max-speed
       - "{{ tts_max_speed | string }}"
       - --segments-dir

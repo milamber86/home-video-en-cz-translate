@@ -67,7 +67,10 @@ voice_ref_wav: "{{ playbook_dir }}/files/voices/czech_default_ref.wav"
 voice_ref_text: "{{ playbook_dir }}/files/voices/czech_default_ref.txt"
 f5_model: F5TTS_v1_Base
 f5_nfe_step: 32
-tts_max_speed: 1.35
+# Every cue is sped by tts_base_speed. Overflow only goes up to tts_max_speed
+# so Czech can fit English slots without large sentence-to-sentence jumps.
+tts_base_speed: 1.15
+tts_max_speed: 1.25
 f5_ckpt_dir: "{{ playbook_dir }}/models/f5_czech"
 tts_engine: auto
 

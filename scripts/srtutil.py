@@ -245,13 +245,54 @@ def load_srt(path: str | Path, *, sentences: bool = True) -> list[srt.Subtitle]:
                 content=content,
             )
         )
-    if is_rolling_captions(cleaned):
+    if sentences and is_rolling_captions(cleaned):
         cleaned = unroll_rolling_cues(cleaned)
     if sentences:
         cleaned = cues_to_sentences(cleaned)
     if not cleaned:
         raise ValueError(f"No usable cues in {path}")
     return _renumber(cleaned)
+
+
+def _bare_cue(text: str) -> str:
+    return re.sub(r"[.!?…,;:]+$", "", (text or "").strip()).casefold()
+
+
+def is_echo_cue(prev: str, cur: str) -> bool:
+    """True when `cur` is a YouTube leftover that repeats the end of `prev`."""
+    previous = _bare_cue(prev)
+    current = _bare_cue(cur)
+    if not current or not previous:
+        return False
+    words = current.split()
+    if len(words) > 5:
+        return False
+    if current in {"period", "tečka"}:
+        return False
+    if previous.endswith(current):
+        return True
+    prev_words = previous.split()
+    return bool(prev_words) and words == prev_words[-len(words) :]
+
+
+def drop_echo_cues(cues: list[srt.Subtitle]) -> list[srt.Subtitle]:
+    """Drop 'theologian.' / 'every Sunday.' leftovers; keep the previous sentence."""
+    out: list[srt.Subtitle] = []
+    for cue in cues:
+        text = (cue.content or "").strip()
+        if not text:
+            continue
+        if out and is_echo_cue(out[-1].content, text):
+            prev = out[-1]
+            out[-1] = srt.Subtitle(
+                index=prev.index,
+                start=prev.start,
+                end=max(prev.end, cue.end),
+                content=prev.content,
+            )
+            continue
+        out.append(cue)
+    return _renumber(out)
 
 
 def save_srt(path: str | Path, cues: list[srt.Subtitle]) -> None:

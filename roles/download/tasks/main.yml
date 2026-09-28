@@ -78,11 +78,11 @@
   loop: "{{ ytdlp_parts.files | default([]) }}"
   when: not video_stat.stat.exists
 
-- name: Download video and English subtitles
+- name: Download video
   ansible.builtin.command:
-    argv: "{{ ytdlp_args + ytdlp_cookie_args + [youtube_url] }}"
+    argv: "{{ ytdlp_video_args + ytdlp_cookie_args + [youtube_url] }}"
   vars:
-    ytdlp_args:
+    ytdlp_video_args:
       - "{{ venv_python }}"
       - -m
       - yt_dlp
@@ -94,12 +94,6 @@
       - "{{ ytdlp_format }}"
       - --merge-output-format
       - mp4
-      - --write-subs
-      - --write-auto-subs
-      - --sub-langs
-      - en.*
-      - --convert-subs
-      - srt
       - --restrict-filenames
       - --continue
       - --retries
@@ -113,6 +107,45 @@
   failed_when: ytdlp_download.rc != 0
   environment: "{{ brew_env }}"
   when: not video_stat.stat.exists
+
+- name: Download English subtitles if YouTube allows
+  ansible.builtin.command:
+    argv: "{{ ytdlp_sub_args + ytdlp_cookie_args + [youtube_url] }}"
+  vars:
+    ytdlp_sub_args:
+      - "{{ venv_python }}"
+      - -m
+      - yt_dlp
+      - --js-runtimes
+      - "deno:{{ brew_bin }}/deno"
+      - --remote-components
+      - ejs:github
+      - --skip-download
+      - --write-subs
+      - --write-auto-subs
+      - --sub-langs
+      - en
+      - --convert-subs
+      - srt
+      - --sleep-subtitles
+      - "2"
+      - --retries
+      - "3"
+      - --restrict-filenames
+      - --output
+      - "{{ job_dir }}/raw/%(id)s.%(ext)s"
+    ytdlp_cookie_args: "{{ ['--cookies-from-browser', ytdlp_cookies_from_browser] if ytdlp_cookies_from_browser | length > 0 else [] }}"
+  register: ytdlp_subs
+  failed_when: false
+  changed_when: ytdlp_subs.rc == 0
+  environment: "{{ brew_env }}"
+
+- name: Warn when YouTube captions are unavailable
+  ansible.builtin.debug:
+    msg: >-
+      YouTube captions skipped ({{ ytdlp_subs.stderr | default('') | trim | regex_search('ERROR:.*') | default('unavailable', true) }}).
+      English will come from Whisper.
+  when: ytdlp_subs.rc | default(0) != 0
 
 - name: Recheck downloaded video
   ansible.builtin.stat:

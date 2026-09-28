@@ -18,6 +18,31 @@
     path: "{{ remux_output }}"
   register: remux_stat
 
+- name: Stat Czech vocals for remux freshness
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/tts/czech_vocals.wav"
+  register: remux_vocals
+
+- name: Stat Czech SRT for remux freshness
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/subs/cs.srt"
+  register: remux_cs
+
+- name: Remove remux when Czech vocals or subtitles are newer
+  ansible.builtin.file:
+    path: "{{ remux_output }}"
+    state: absent
+  when: >-
+    remux_stat.stat.exists and (
+      (remux_vocals.stat.exists and remux_vocals.stat.mtime > remux_stat.stat.mtime)
+      or (remux_cs.stat.exists and remux_cs.stat.mtime > remux_stat.stat.mtime)
+    )
+
+- name: Recheck remux output after stale wipe
+  ansible.builtin.stat:
+    path: "{{ remux_output }}"
+  register: remux_stat
+
 - name: Mix Czech vocals with original accompaniment
   ansible.builtin.command:
     argv:

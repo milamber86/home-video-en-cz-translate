@@ -24,6 +24,7 @@ apple_device.bootstrap_mps_fallback()
 
 import srt  # noqa: E402
 from srtutil import (  # noqa: E402
+    drop_echo_cues,
     load_srt,
     save_srt,
     segments_to_cues,
@@ -118,6 +119,11 @@ def parse_args() -> argparse.Namespace:
         "--glossary-out",
         default="",
         help="Write glossary JSON here (default: next to --out-cs)",
+    )
+    p.add_argument(
+        "--force-asr",
+        action="store_true",
+        help="Redo mlx-whisper even if subs/whisper.en.srt exists",
     )
     return p.parse_args()
 
@@ -319,6 +325,39 @@ def _near_dup_cs(left: str, right: str) -> bool:
     return bool(sa and sb) and len(sa & sb) / max(len(sa), len(sb)) >= 0.6
 
 
+_LEAK_PREFIX = re.compile(
+    r"^(?:pamatujte(?:\s+si)?|paměťte|vzpoměňte(?:\s+si)?|remember|pamatuj|ale)\s*:\s*",
+    re.IGNORECASE,
+)
+_CAPS_LABEL = re.compile(
+    r"^([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]{4,}):\s+(\S.*)$"
+)
+_LEAK_ONLY = re.compile(
+    r"^(?:mluvčí je (?:žena|muž)|řečnice je žena|řečník je muž|"
+    r"já jsem (?:žena|muž)|the speaker is a (?:wo)?man|"
+    r"ženský rod|mužský rod)\.?$",
+    re.IGNORECASE,
+)
+
+
+def strip_instruction_leak(text: str) -> str:
+    text = (text or "").strip()
+    for _ in range(3):
+        nxt = _LEAK_PREFIX.sub("", text).strip()
+        if nxt == text:
+            break
+        text = nxt
+    if _LEAK_ONLY.fullmatch(text):
+        return ""
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+    caps = _CAPS_LABEL.match(text)
+    if caps and caps.group(2)[:1].islower():
+        text = caps.group(2)
+        text = text[0].upper() + text[1:]
+    return text
+
+
 def clean_translategemma(
     text: str, context_cs: list[str] | None = None
 ) -> str:
@@ -335,7 +374,8 @@ def clean_translategemma(
     while len(lines) > 1 and _near_dup_cs(lines[0], lines[1]):
         keep = lines[0] if len(lines[0]) >= len(lines[1]) else lines[1]
         lines = [keep, *lines[2:]]
-    return lines[0] if lines else ""
+    text = strip_instruction_leak(lines[0] if lines else "")
+    return text
 
 
 def local_cue_translation(text: str, prev_en: str, prev_cs: str) -> str | None:
@@ -417,11 +457,41 @@ def translategemma_prompt(
         "Produce only the Czech translation, without any additional explanations "
         "or commentary. Please translate the following English text into Czech:"
     )
-    if gender == "female":
-        parts.append("Remember: the speaker is a woman (ženský rod).")
-    elif gender == "male":
-        parts.append("Remember: the speaker is a man (mužský rod).")
     return "\n".join(parts) + "\n\n\n" + (text or "").strip()
+
+
+def _load_tg_progress(
+    path: Path, texts: list[str], genders: list[str]
+) -> list[str]:
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        apple_device.log(f"Ignoring TranslateGemma progress ({exc})")
+        return []
+    if not isinstance(saved, dict):
+        apple_device.log("Ignoring TranslateGemma progress (old format, source changed)")
+        return []
+    if saved.get("en") != texts or saved.get("genders") != genders:
+        apple_device.log("Ignoring TranslateGemma progress (English or gender map changed)")
+        return []
+    cs = saved.get("cs")
+    if not isinstance(cs, list) or not all(isinstance(item, str) for item in cs):
+        return []
+    return cs[: len(texts)]
+
+
+def _save_tg_progress(
+    path: Path, texts: list[str], out: list[str], genders: list[str]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"en": texts, "genders": genders, "cs": out},
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def translategemma_translate(
@@ -431,22 +501,17 @@ def translategemma_translate(
     timeout: float,
     gender: str,
     progress_path: Path | None = None,
+    genders: list[str] | None = None,
 ) -> list[str]:
+    line_gender = genders if genders and len(genders) == len(texts) else [gender] * len(texts)
     out: list[str] = []
     if progress_path and progress_path.is_file():
-        try:
-            saved = json.loads(progress_path.read_text(encoding="utf-8"))
-            if isinstance(saved, list) and all(isinstance(item, str) for item in saved):
-                out = saved[: len(texts)]
-                if out:
-                    apple_device.log(
-                        f"Resuming TranslateGemma at {len(out) + 1}/{len(texts)}"
-                    )
-        except Exception as exc:
-            apple_device.log(f"Ignoring TranslateGemma progress ({exc})")
-            out = []
+        out = _load_tg_progress(progress_path, texts, line_gender)
+        if out:
+            apple_device.log(f"Resuming TranslateGemma at {len(out) + 1}/{len(texts)}")
     for i in range(len(out), len(texts)):
         text = texts[i]
+        this_gender = line_gender[i]
         prev_en = texts[i - 1] if i else ""
         prev_cs = out[i - 1] if i else ""
         local = local_cue_translation(text, prev_en, prev_cs) if text.strip() else ""
@@ -457,22 +522,57 @@ def translategemma_translate(
             out.append(local)
         else:
             ctx = list(zip(texts[max(0, i - 3) : i], out[max(0, i - 3) : i]))
-            apple_device.log(f"TranslateGemma {i + 1}/{len(texts)}")
+            apple_device.log(
+                f"TranslateGemma {i + 1}/{len(texts)} gender={this_gender}"
+            )
             raw = ollama_plain(
-                url, model, translategemma_prompt(text, ctx, gender), timeout
+                url,
+                model,
+                translategemma_prompt(text, ctx, this_gender),
+                timeout,
             )
             out.append(clean_translategemma(raw, [cs for _, cs in ctx]))
         if progress_path is not None:
-            progress_path.parent.mkdir(parents=True, exist_ok=True)
-            progress_path.write_text(
-                json.dumps(out, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
+            _save_tg_progress(progress_path, texts, out, line_gender)
     for i, text in enumerate(texts[: len(out)]):
         local = local_cue_translation(
             text, texts[i - 1] if i else "", out[i - 1] if i else ""
         )
         if local:
             out[i] = local
+            continue
+        cleaned = clean_translategemma(out[i])
+        if cleaned:
+            out[i] = cleaned
+            continue
+        this_gender = line_gender[i]
+        ctx = list(zip(texts[max(0, i - 3) : i], out[max(0, i - 3) : i]))
+        apple_device.log(
+            f"TranslateGemma retry empty/leak {i + 1}/{len(texts)} gender={this_gender}"
+        )
+        raw = ollama_plain(
+            url,
+            model,
+            translategemma_prompt(text, ctx, this_gender),
+            timeout,
+        )
+        out[i] = clean_translategemma(raw, [cs for _, cs in ctx])
+        if not out[i]:
+            raw = ollama_plain(
+                url,
+                model,
+                translategemma_prompt(text, [], this_gender),
+                timeout,
+            )
+            out[i] = clean_translategemma(raw)
+        if not out[i]:
+            raise RuntimeError(
+                f"TranslateGemma produced empty Czech for cue {i + 1}: {text!r}"
+            )
+        if progress_path is not None:
+            _save_tg_progress(progress_path, texts, out, line_gender)
+    if len(out) != len(texts) or any(not (item or "").strip() for item in out):
+        raise RuntimeError("TranslateGemma cue count or empty-line mismatch")
     return capitalize_echoes(texts, out)
 
 
@@ -785,10 +885,68 @@ def marian_translate(texts: list[str], model: str, device: str) -> list[str]:
     return out
 
 
+_MALE_HINT = re.compile(
+    r"\b(he|him|his|man|mr\.?|sir|father|brother|guy|king|pope|televangelist)\b",
+    re.IGNORECASE,
+)
+_FEMALE_HINT = re.compile(
+    r"\b(she|her|hers|woman|mrs\.?|ms\.?|miss|sister|mother|queen|lady)\b",
+    re.IGNORECASE,
+)
+
+
+def _guest_line_gender(rows: list[dict], index: int, narrator: str) -> str:
+    window = " ".join(
+        rows[j]["text"]
+        for j in range(max(0, index - 1), min(len(rows), index + 2))
+    )
+    male = bool(_MALE_HINT.search(window))
+    female = bool(_FEMALE_HINT.search(window))
+    if male and not female:
+        return "male"
+    if female and not male:
+        return "female"
+    f0 = float(rows[index].get("f0") or float("nan"))
+    if f0 == f0 and f0 <= 142:
+        return "male"
+    if f0 == f0 and f0 >= 185:
+        return "female"
+    return "male" if narrator == "female" else "female"
+
+
+def cue_line_genders(
+    audio: str | None, cues: list, narrator: str
+) -> list[str]:
+    """Guest lines use the guest's gender so quotes are not she-inflected."""
+    if not audio or not Path(audio).is_file() or not cues:
+        return [narrator] * len(cues)
+    try:
+        from synthesize_czech import classify_cue_speakers
+
+        rows = classify_cue_speakers(Path(audio), cues)
+    except Exception as exc:
+        apple_device.log(f"Per-line speaker gender skipped ({exc})")
+        return [narrator] * len(cues)
+    out: list[str] = []
+    for i, row in enumerate(rows):
+        if row.get("label") != 1:
+            out.append(narrator)
+            continue
+        out.append(_guest_line_gender(rows, i, narrator))
+    guests = sum(1 for a, b in zip(out, [narrator] * len(out)) if a != b)
+    apple_device.log(
+        f"Per-line gender: {guests}/{len(out)} guest lines "
+        f"({sum(1 for g in out if g == 'male')} male, "
+        f"{sum(1 for g in out if g == 'female')} female)"
+    )
+    return out
+
+
 def translate_cues(
     texts: list[str],
     args: argparse.Namespace,
     glossary_path: Path | None = None,
+    cues: list | None = None,
 ) -> list[str]:
     backend = args.translation_backend
     device = apple_device.device_str(args.device)
@@ -826,6 +984,11 @@ def translate_cues(
             if glossary_path is not None
             else None
         )
+        line_genders = (
+            cue_line_genders(args.audio, cues, gender)
+            if cues is not None and len(cues) == len(texts)
+            else None
+        )
         return translategemma_translate(
             args.ollama_url,
             model,
@@ -833,6 +996,7 @@ def translate_cues(
             args.ollama_timeout,
             gender,
             progress_path=progress,
+            genders=line_genders,
         )
     apple_device.log(f"Translating with Ollama model={model} (idiomatic Czech)")
     chat = pick_chat_model(tags, model) or model
@@ -904,16 +1068,30 @@ def translate_cues(
 
 
 def english_cues(args: argparse.Namespace) -> list[srt.Subtitle]:
-    if args.en_srt and Path(args.en_srt).is_file():
+    """Prefer mlx-whisper on vocals. YouTube SRT is fallback only."""
+    asr_path = Path(args.out_en).with_name("whisper.en.srt")
+    whisper: list[srt.Subtitle] | None = None
+    if not args.force_asr and asr_path.is_file():
         try:
-            cues = load_srt(args.en_srt, sentences=True)
-            apple_device.log(f"Using English SRT as {len(cues)} sentences")
-            return cues
+            whisper = load_srt(asr_path, sentences=False)
+            apple_device.log(
+                f"Reusing Whisper transcript {asr_path} ({len(whisper)} sentences)"
+            )
         except ValueError as exc:
-            apple_device.log(f"Ignoring unusable SRT {args.en_srt}: {exc}")
-    if not args.audio or not Path(args.audio).is_file():
-        raise SystemExit("Need --en-srt with cues or a readable --audio file")
-    return transcribe_mlx(args.audio, args.whisper_model)
+            apple_device.log(f"Ignoring unusable Whisper cache {asr_path}: {exc}")
+            whisper = None
+    if whisper is None and args.audio and Path(args.audio).is_file():
+        whisper = transcribe_mlx(args.audio, args.whisper_model)
+        save_srt(asr_path, whisper)
+        apple_device.log(f"Wrote {asr_path}")
+    if whisper:
+        cues = drop_echo_cues(whisper)
+        apple_device.log(f"English source=Whisper ({len(cues)} sentences)")
+        return cues
+    if args.en_srt and Path(args.en_srt).is_file():
+        apple_device.log("No Whisper transcript; falling back to YouTube English SRT")
+        return drop_echo_cues(load_srt(args.en_srt, sentences=True))
+    raise SystemExit("Need a readable --audio file (or --en-srt as fallback)")
 
 
 def main() -> int:
@@ -928,10 +1106,10 @@ def main() -> int:
     texts = [c.content for c in cues]
     glossary_path = Path(args.glossary_out) if args.glossary_out else out_cs.with_name("glossary.json")
     apple_device.log(f"Translating {len(texts)} sentences to Czech")
-    czech = translate_cues(texts, args, glossary_path=glossary_path)
-    if len(czech) != len(cues):
+    czech = translate_cues(texts, args, glossary_path=glossary_path, cues=cues)
+    if len(czech) != len(cues) or any(not (t or "").strip() for t in czech):
         raise SystemExit(
-            f"Translation produced {len(czech)} cues, expected {len(cues)}"
+            f"Translation produced {len(czech)} cues, expected {len(cues)} non-empty"
         )
 
     cs_cues = [
@@ -939,6 +1117,11 @@ def main() -> int:
         for c, t in zip(cues, czech)
     ]
     save_srt(out_cs, cs_cues)
+    written = load_srt(out_cs, sentences=False)
+    if len(written) != len(cues):
+        raise SystemExit(
+            f"Wrote {len(written)} Czech cues, expected {len(cues)}"
+        )
     apple_device.log(f"Wrote {out_en} and {out_cs}")
     return 0
 
