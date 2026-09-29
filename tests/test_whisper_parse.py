@@ -53,6 +53,21 @@ def test_as_str_list_str():
     assert wt._as_str_list("  ") == []
 
 
+def test_as_str_list_picks_longest_of_several_lists():
+    data = {"notes": ["ignore"], "compressed": ["První.", "Druhá."]}
+    assert wt._as_str_list(data) == ["První.", "Druhá."]
+
+
+def test_as_str_list_accepts_numbered_string_map():
+    data = {"1": "První.", "2": "Druhá."}
+    assert wt._as_str_list(data) == ["První.", "Druhá."]
+
+
+def test_parse_json_array_mangled_object_key():
+    text = '{"[\\\\": ["Jak to funguje."] }'
+    assert wt.parse_json_array(text) == ["Jak to funguje."]
+
+
 def test_align_translations_exact():
     assert wt.align_translations(["a", "b"], ["x", "y"], "") == ["a", "b"]
 

@@ -1,0 +1,57 @@
+---
+- name: Load last job facts
+  ansible.builtin.include_vars: "{{ work_root }}/current_job.yml"
+  when: video_id is not defined
+
+- name: Stat Czech SRT for reflow
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/subs/cs.srt"
+  register: cs_srt_reflow
+
+- name: Stat isolated vocals for reflow timing
+  ansible.builtin.stat:
+    path: "{{ job_dir }}/audio/vocals.wav"
+  register: reflow_vocals
+
+- name: Compress Czech cues that cannot fit their slot
+  ansible.builtin.command:
+    argv: "{{ reflow_args + reflow_dry_args }}"
+  vars:
+    reflow_args:
+      - "{{ venv_python }}"
+      - "{{ scripts_dir }}/reflow_czech.py"
+      - --cs-srt
+      - "{{ job_dir }}/subs/cs.srt"
+      - --en-srt
+      - "{{ job_dir }}/subs/en.srt"
+      - --vocals
+      - "{{ job_dir }}/audio/vocals.wav"
+      - --url
+      - "{{ ollama_url }}"
+      - --model
+      - "{{ reflow_chat_model }}"
+      - --base-speed
+      - "{{ tts_base_speed | string }}"
+      - --max-speed
+      - "{{ tts_max_speed | string }}"
+      - --chars-per-sec
+      - "{{ reflow_chars_per_sec | string }}"
+      - --report
+      - "{{ job_dir }}/subs/reflow.json"
+    reflow_dry_args: "{{ ['--dry-run'] if (reflow_dry_run | default(false) | bool) else [] }}"
+  environment: "{{ brew_env }}"
+  register: reflow_run
+  changed_when: >-
+    'Reflow: wrote' in (reflow_run.stderr | default(''))
+    or 'would change' in (reflow_run.stderr | default(''))
+  failed_when: reflow_run.rc != 0
+  when:
+    - reflow_enabled | default(true) | bool
+    - cs_srt_reflow.stat.exists
+
+- name: Show reflow summary
+  ansible.builtin.debug:
+    msg: "{{ reflow_run.stderr_lines | default([]) | select('search', 'Reflow') | list }}"
+  when:
+    - reflow_enabled | default(true) | bool
+    - cs_srt_reflow.stat.exists

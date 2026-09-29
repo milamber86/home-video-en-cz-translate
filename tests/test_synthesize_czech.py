@@ -92,7 +92,14 @@ def test_trim_tts_tail_cuts_trailing_silence():
     audio = np.concatenate([_tone(1.0, sr), np.full(int(0.6 * sr), 1e-6, np.float32)])
     out = sc.trim_tts_tail(audio, sr)
     dur = len(out) / sr
-    assert 0.9 <= dur <= 1.1
+    assert 0.9 <= dur <= 1.15
+
+
+def test_trim_tts_tail_keeps_voiced_audio():
+    sr = 48000
+    audio = _tone(1.0, sr)
+    out = sc.trim_tts_tail(audio, sr)
+    assert len(out) == len(audio)
 
 
 def test_trim_tts_tail_returns_short_audio_with_fade():
@@ -218,12 +225,22 @@ def test_needs_retry():
     assert sc.needs_retry("ahoj", "ahoj ahoj ahoj ahoj ahoj ahoj ahoj", 0.45)
 
 
-def test_trim_by_alignment():
+def test_trim_by_alignment_keeps_voiced_tail():
     sr = 100
     audio = np.ones(1000, dtype=np.float32)
-    trimmed, changed = sc.trim_by_alignment(audio, sr, [{"end": 3.0}])
+    out, changed = sc.trim_by_alignment(audio, sr, [{"end": 3.0}])
+    assert not changed
+    assert len(out) == 1000
+
+
+def test_trim_by_alignment_cuts_trailing_silence():
+    sr = 100
+    audio = np.concatenate(
+        [np.ones(300, dtype=np.float32), np.zeros(700, dtype=np.float32)]
+    )
+    out, changed = sc.trim_by_alignment(audio, sr, [{"end": 2.5}])
     assert changed
-    assert len(trimmed) == 306
+    assert len(out) == 306
     same, changed = sc.trim_by_alignment(audio, sr, [])
     assert not changed
     assert len(same) == 1000

@@ -86,6 +86,15 @@ tts_qa: true
 f5_ckpt_dir: "{{ playbook_dir }}/models/f5_czech"
 tts_engine: auto
 
+# Secondary translation pass (roles/reflow): shortens Czech cues that cannot
+# fit their original slot, so fewer lines are sped up or overlap. Timing comes
+# from the isolated vocal stem when available.
+reflow_enabled: true
+reflow_dry_run: false
+reflow_chat_model: qwen2.5:14b
+# Spoken Czech rate used to predict cue duration; raise if your voice is faster.
+reflow_chars_per_sec: 14.0
+
 # Czech F5 fine-tune (VoxPopuli Czech; Common Voice is no longer on Hugging Face)
 f5_train_dataset: facebook/voxpopuli
 f5_train_dataset_config: cs

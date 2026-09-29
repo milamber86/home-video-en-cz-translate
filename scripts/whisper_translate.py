@@ -82,6 +82,9 @@ _LIST_KEYS = (
     "output",
     "result",
     "items",
+    "lines",
+    "compressed",
+    "results",
 )
 _ITEM_KEYS = ("cs", "cs_text", "translation", "text", "czech", "content")
 
@@ -163,6 +166,13 @@ def _as_str_list(data: object) -> list[str]:
         lists = [v for v in data.values() if isinstance(v, list)]
         if len(lists) == 1:
             return _as_str_list(lists[0])
+        if lists:
+            return _as_str_list(max(lists, key=len))
+        strings = [
+            str(v).strip() for v in data.values() if isinstance(v, str) and str(v).strip()
+        ]
+        if strings:
+            return strings
         raise ValueError("JSON object has no translation list")
     if not isinstance(data, list):
         raise ValueError("JSON value is not a list")

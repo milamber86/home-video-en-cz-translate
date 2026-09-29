@@ -28,7 +28,13 @@ import numpy as np  # noqa: E402
 import soundfile as sf  # noqa: E402
 
 from czech_tts_text import expand_for_tts  # noqa: E402
-from srtutil import cue_seconds, load_srt  # noqa: E402
+from srtutil import load_srt  # noqa: E402
+from timing import (  # noqa: E402
+    cue_slot,
+    cue_timings,
+    load_speech_regions,
+    voiced_end,
+)
 
 BASE_GRAPHEME_FIX = str.maketrans({"ů": "ú", "Ů": "Ú", "ď": "d", "Ď": "D"})
 VITS_MODEL = "tts_models/cs/cv/vits"
@@ -210,11 +216,12 @@ def trim_tts_tail(audio: np.ndarray, sr: int) -> np.ndarray:
             speech = speech[:prev_e]
     if speech.any():
         last = int(np.max(np.nonzero(speech)[0]))
-        cut = min(len(audio), (last + 2) * frame)
-        audio = audio[:cut]
-    # Drop the last unstable XTTS samples.
-    keep = max(int(0.08 * sr), len(audio) - int(0.045 * sr))
-    audio = audio[:keep]
+        voiced_samples = min(len(audio), (last + 2) * frame)
+        audio = audio[:voiced_samples]
+        # Keep a short release after the last voiced frame; cutting voiced
+        # audio is what used to clip final syllables.
+        keep = max(int(0.08 * sr), min(len(audio), voiced_samples + int(0.06 * sr)))
+        audio = audio[:keep]
     return fade_out(audio.astype(np.float32), sr, 0.04)
 
 
@@ -563,22 +570,6 @@ def pocket_batch(
         jobs_path.unlink(missing_ok=True)
 
 
-def cue_slot(cue, next_cue) -> float:
-    """Cue duration plus a bounded spill into the silence after it.
-
-    Overlapping only matters when the next cue follows hard on this one; when
-    there is a gap, letting audio run into it is inaudible. Keeps at least
-    `keep_gap` seconds of silence before the next cue.
-    """
-    slot = max(cue_seconds(cue), 0.08)
-    if next_cue is None:
-        return slot
-    gap = (next_cue.start - cue.end).total_seconds()
-    if gap < 0.15:
-        return slot
-    return slot + min(gap * 0.7, gap - 0.1, 2.0)
-
-
 def normalize_for_cer(text: str) -> str:
     text = unicodedata.normalize("NFKC", text or "").casefold()
     return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
@@ -608,7 +599,13 @@ def needs_retry(ref: str, hyp: str, threshold: float) -> bool:
     return char_error_rate(ref_n, hyp_n) > threshold
 
 
-def trim_by_alignment(audio: np.ndarray, sr: int, words: list[dict], keep_s: float = 0.06):
+def trim_by_alignment(audio: np.ndarray, sr: int, words: list[dict], keep_s: float = 0.25):
+    """Cut trailing audio after the last ASR word, never cutting voiced frames.
+
+    Whisper's final word-end often lands before the syllable release, so the
+    cut is pushed out to at least the end of the last voiced frame plus a
+    short release.
+    """
     ends = [
         float(w["end"])
         for w in words
@@ -616,7 +613,8 @@ def trim_by_alignment(audio: np.ndarray, sr: int, words: list[dict], keep_s: flo
     ]
     if not ends:
         return audio, False
-    cut = min(max(ends) + keep_s, len(audio) / sr)
+    voiced = voiced_end(audio, sr)
+    cut = min(max(max(ends) + keep_s, voiced + 0.06), len(audio) / sr)
     n = int(cut * sr)
     if n <= 0 or n >= len(audio):
         return audio, False
@@ -1222,6 +1220,19 @@ def main() -> int:
     glossary_path: Path | None = glossary_file if glossary_file.is_file() else None
     if glossary_path is not None:
         apple_device.log(f"TTS glossary={glossary_path}")
+    timings = None
+    if _path_ready(args.vocals):
+        try:
+            regions = load_speech_regions(args.vocals)
+        except Exception as exc:
+            apple_device.log(f"TTS timing from vocals unavailable ({exc})")
+        else:
+            if regions:
+                timings = cue_timings(cues, regions)
+                apple_device.log(
+                    f"TTS timing: {len(regions)} voiced spans from vocals; "
+                    "cues start at the original speech onset"
+                )
     pieces: list[tuple[float, np.ndarray]] = []
     gen_sr = 24000
     pending_coqui: list[dict] = []
@@ -1235,8 +1246,13 @@ def main() -> int:
                 continue
             text_tag = spoken_cache_tag(text)
             fitted = segments_dir / f"{i:04d}.{fit_tag}.{text_tag}.wav"
-            start = cue.start.total_seconds()
-            slot = cue_slot(cue, cues[i] if i < len(cues) else None)
+            if timings is not None:
+                timing = timings[i - 1]
+                start = timing.start_at
+                slot = timing.slot
+            else:
+                start = cue.start.total_seconds()
+                slot = cue_slot(cue, cues[i] if i < len(cues) else None)
             if not args.fresh and usable_segment(fitted):
                 samples, seg_sr = load_mono(fitted)
                 gen_sr = int(seg_sr)

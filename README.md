@@ -43,6 +43,10 @@ Useful extra-vars:
 | `tts_engine` | `auto` | Prefers Pocket TTS Czech when `.venv-pocket` exists and a reference is available; then pretrained XTTS-v2 when `model.pth` is cached (comparison baseline). Else Czech F5 if `models/f5_czech` exists. Else Piper/VITS by gender. |
 | `speaker_gender` | `auto` | Narrator gender for Czech agreement. `auto` infers from the transcript, then from `vocals.wav` pitch. Override with `male` or `female` |
 | `force_translate` | `false` | Redo `subs/en.srt` and `subs/cs.srt` even if they exist. Reuses `subs/whisper.en.srt` unless you delete it or pass `--force-asr` |
+| `reflow_enabled` | `true` | Secondary pass that compresses Czech cues which cannot fit their slot |
+| `reflow_dry_run` | `false` | Report `subs/reflow.json` without rewriting `cs.srt` |
+| `reflow_chat_model` | `qwen2.5:14b` | Chat model used for compression |
+| `reflow_chars_per_sec` | `14.0` | Spoken-Czech rate used to predict cue duration; raise it if your voice is faster |
 | `force_tts` | `false` | Redo Czech vocals (wipes `tts/segments`) and remux |
 | `output_container` | `mkv` | `mkv` (native SRT) or `mp4` (`mov_text`) |
 | `ollama_model` | `translategemma:12b` | Pulled by the `ollama` role. Dedicated EN→CS. `translategemma:27b` is stronger; `qwen2.5:14b` is a general-chat fallback |
@@ -90,6 +94,8 @@ The default translator is [TranslateGemma](https://ai.google.dev/gemma/docs/tran
 
 The `ollama` role pulls `translategemma:12b` if it is missing.
 
+**Reflow pass (`roles/reflow`, after translation):** Czech runs ~15% longer than English, so some cues cannot fit their slot even at `tts_max_speed`. The reflow stage measures the time each cue may actually use (from the isolated `vocals.wav`, so leading/trailing silence inside a cue counts), predicts the spoken duration at `reflow_chars_per_sec`, and asks the chat model (`reflow_chat_model`, default `qwen2.5:14b`) to compress only the lines that would otherwise be sped up past the cap or overlap the next cue. A line is accepted only when the compressed form fits; otherwise it is retried once with a stricter instruction, and the original is kept if that still fails. The pristine translation is preserved as `subs/cs.orig.srt` (the pass always reflows from it, so it is idempotent and re-runs automatically when translation changes), and `subs/reflow.json` records per-cue slots, estimates, and before/after speeds. Inspect without touching `cs.srt` via `-e reflow_dry_run=true`; disable with `-e reflow_enabled=false`.
+
 **Fine-tuning (Inkling + Tinker):** Possible later, not the first move. Inkling is a huge generalist MoE; Tinker is a cloud LoRA API. Fine-tuning needs thousands of *human* EN–CS spoken-dub pairs. The current `cs.srt` is model output — training on it would lock in today's mistakes. If you later collect gold cues, SFT TranslateGemma or a mid-size Qwen on Tinker beats SFT Inkling. NLLB / MADLAD / Marian are dedicated MT but more literal than a dub needs.
 
 **Highest quality if you leave local-only:** DeepL or a strong cloud LLM with a tight spoken-Czech prompt.
@@ -108,9 +114,9 @@ Official F5-TTS (`F5TTS_v1_Base`) is Chinese+English only and is **not** used fo
 
 Setup prefetches Pocket TTS weights into `models/pocket/` and XTTS-v2. Force an engine with `-e tts_engine=pocket` (or `xtts`, `f5`, `piper`, `vits`). There is no official female Piper Czech voice. VITS is weaker than Jirka.
 
-Every cue gets ASR-based QA (mlx-whisper, same model as the transcription step): the synthesized audio is transcribed, everything after the last recognized word is cut (kills appended echo/reference artifacts), and a cue whose transcript strays too far from the intended text (`--qa-threshold`, default CER 0.45) is re-synthesized once, keeping the better take. Disable with `tts_qa=false` or `--no-qa`. XTTS tails additionally get the energy-based trim (trailing silence and the short echo burst the model often appends). Pocket TTS is a sentence-level model and is driven one sentence per call.
+Every cue gets ASR-based QA (mlx-whisper, same model as the transcription step): the synthesized audio is transcribed, everything after the last recognized word is cut (kills appended echo/reference artifacts), and a cue whose transcript strays too far from the intended text (`--qa-threshold`, default CER 0.45) is re-synthesized once, keeping the better take. Trimming is silence-aware — it never cuts into voiced audio, which is what used to clip final syllables. Disable with `tts_qa=false` or `--no-qa`. XTTS tails additionally get the energy-based trim (trailing silence and the short echo burst the model often appends). Pocket TTS is a sentence-level model and is driven one sentence per call.
 
-Every cue is time-stretched by `tts_base_speed` (default 1.15×) so Czech can keep up with English; a line that still overruns only goes up to `tts_max_speed` (1.25×). Before any speedup is applied, a cue whose next neighbor leaves silence may spill into that gap (up to 70% of it), so most cues play at natural pace without overlapping the next line. Clone refs stay inside each cue’s timestamps (no 4s bleed into the next speaker). Narrator lines share one ref; guest lines use that guest’s audio.
+Dubbed lines are placed against the **original** speaker, not the subtitle edge: when `vocals.wav` is available, its energy profile gives the speech onset and offset inside each cue, so the Czech audio starts when the source speech starts (within ~0.1 s) and its slot is the real spoken span plus a bounded share of the silence that follows — never reaching into the next cue's speech. Every cue is still time-stretched by `tts_base_speed` (default 1.15×) so Czech can keep up with English; a line that overruns only goes up to `tts_max_speed` (1.25×), and the reflow pass shortens the text before that happens. Without `vocals.wav`, the fallback is the cue duration plus gap spill (up to 70% of the silence before the next cue). Clone refs stay inside each cue's timestamps (no 4s bleed into the next speaker). Narrator lines share one ref; guest lines use that guest's audio.
 
 ## Czech F5-TTS (optional, hours-long)
 
@@ -149,7 +155,7 @@ ansible-playbook site.yml --skip-tags setup,ollama,download,demucs \
 roles/          Ansible roles
 scripts/        Python entry points invoked by roles
 files/voices/   Optional bundled F5 reference WAV + transcript (only if a Czech F5 ckpt exists)
-work/<id>/      Per-video artifacts
+work/<id>/      Per-video artifacts (subs/cs.orig.srt + subs/reflow.json from the reflow pass)
 models/piper/   Piper cs_CZ-jirka-medium (gitignored)
 models/f5_czech/  Trained Czech F5 checkpoint (gitignored)
 .venv-xtts/     Isolated Coqui env for XTTS-v2 and VITS (gitignored)

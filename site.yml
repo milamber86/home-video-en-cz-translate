@@ -14,6 +14,8 @@
       tags: [demucs]
     - role: whisper_translate
       tags: [whisper_translate, translate]
+    - role: reflow
+      tags: [reflow, translate]
     - role: f5_tts
       tags: [f5_tts, tts]
     - role: remux
