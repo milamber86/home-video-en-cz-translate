@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import math
@@ -34,6 +35,7 @@ from timing import (  # noqa: E402
     cue_timings,
     load_speech_regions,
     voiced_end,
+    voiced_start,
 )
 
 BASE_GRAPHEME_FIX = str.maketrans({"ů": "ú", "Ů": "Ú", "ď": "d", "Ď": "D"})
@@ -43,7 +45,6 @@ POCKET_CONFIG = (
     "hf://vvolhejn/pocket-tts-czech/czech.yaml"
     "@7c1fbd0acba765617749dd17f3dbddc2be791cc7"
 )
-XTTS_RETRY_TEMPERATURE = 0.45
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,9 +84,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pocket-python", default="", help="Interpreter for isolated .venv-pocket (Pocket TTS)")
     p.add_argument("--pocket-config", default=POCKET_CONFIG, help="Pocket TTS model config (hf:// YAML)")
     p.add_argument("--pocket-temperature", type=float, default=None, help="Pocket TTS temperature override")
-    p.add_argument("--no-qa", action="store_true", help="Disable per-cue ASR QA (aligned trim + one retry)")
+    p.add_argument("--no-qa", action="store_true", help="Disable per-cue ASR QA loop")
     p.add_argument("--qa-model", default="", help="Whisper model for cue QA (default: --whisper-model)")
-    p.add_argument("--qa-threshold", type=float, default=0.45, help="CER that triggers one TTS retry")
+    p.add_argument("--qa-attempts", type=int, default=3, help="Max takes per cue in the QA loop")
+    p.add_argument("--qa-cer", type=float, default=0.15, help="Accepted CER between speech and source text")
+    p.add_argument("--qa-max-cps", type=float, default=22.0, help="Cue speaking-rate truncation threshold")
     p.add_argument("--vits-model", default=VITS_MODEL, help="Coqui Czech VITS model name")
     p.add_argument(
         "--glossary",
@@ -575,6 +578,10 @@ def normalize_for_cer(text: str) -> str:
     return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
 
 
+def norm_words(text: str) -> list[str]:
+    return normalize_for_cer(text).split()
+
+
 def char_error_rate(ref: str, hyp: str) -> float:
     ref_n, hyp_n = normalize_for_cer(ref), normalize_for_cer(hyp)
     if not ref_n:
@@ -588,15 +595,74 @@ def char_error_rate(ref: str, hyp: str) -> float:
     return prev[-1] / len(ref_n)
 
 
-def needs_retry(ref: str, hyp: str, threshold: float) -> bool:
-    """Bad transcript (high CER) or an echo signature (extra words)."""
-    ref_n, hyp_n = normalize_for_cer(ref), normalize_for_cer(hyp)
-    if not hyp_n:
-        return True
-    ref_words, hyp_words = ref_n.split(), hyp_n.split()
-    if len(hyp_words) > len(ref_words) * 1.5 + 2:
-        return True
-    return char_error_rate(ref_n, hyp_n) > threshold
+def word_diff(ref_w: list[str], hyp_w: list[str]):
+    """Opcode alignment between two normalized word lists."""
+    return difflib.SequenceMatcher(a=ref_w, b=hyp_w, autojunk=False).get_opcodes()
+
+
+def tail_omissions(ref_w: list[str], hyp_w: list[str]) -> list[str]:
+    """Trailing reference words the hypothesis never reached (truncated tail)."""
+    matched_end = 0
+    for tag, _i1, i2, _j1, _j2 in word_diff(ref_w, hyp_w):
+        if tag == "equal":
+            matched_end = i2
+    return ref_w[matched_end:]
+
+
+def missing_words(ref_w: list[str], hyp_w: list[str]) -> list[str]:
+    """Every reference word absent from the hypothesis (any omission)."""
+    out: list[str] = []
+    for tag, i1, i2, _j1, _j2 in word_diff(ref_w, hyp_w):
+        if tag in ("delete", "replace"):
+            out.extend(ref_w[i1:i2])
+    return out
+
+
+def assess_cue(
+    spoken_ref: str, hyp: str, gen_sec: float, accept_cer: float, max_cps: float
+) -> dict:
+    """Full verdict for one synthesized cue against its spoken source text.
+
+    Checks character error rate, whole-word omissions, a truncated tail (the
+    missing-last-word / syllable signature), and implausibly short audio
+    (silent ending). `ok` gates acceptance; anything else triggers another
+    generation attempt or a tail repair.
+    """
+    hyp_spoken = expand_for_tts(hyp or "")
+    ref_w = norm_words(spoken_ref)
+    hyp_w = norm_words(hyp_spoken)
+    cer = char_error_rate(" ".join(ref_w), " ".join(hyp_w))
+    missing = missing_words(ref_w, hyp_w)
+    tail = tail_omissions(ref_w, hyp_w)
+    too_fast = bool(gen_sec) and gen_sec < len(spoken_ref.strip()) / max(max_cps, 1.0)
+    empty = not hyp_w
+    ok = (not empty) and cer <= accept_cer and not tail and not too_fast
+    return {
+        "cer": cer,
+        "missing": missing,
+        "tail": tail,
+        "too_fast": too_fast,
+        "empty": empty,
+        "ok": ok,
+    }
+
+
+QA_REGEN_TEMPS = {
+    "pocket": (0.45, 0.2, 0.35, 0.55),
+    "xtts": (0.45, 0.35, 0.55, 0.4),
+}
+
+
+def regen_temperature(engine: str, regen_index: int) -> float | None:
+    """Sampling temperature for regeneration attempt `regen_index` (1-based).
+
+    Each attempt samples differently so a retry can escape the artifact that
+    produced the previous take. None keeps the engine's configured default.
+    """
+    temps = QA_REGEN_TEMPS.get(engine)
+    if not temps:
+        return None
+    return temps[max(0, regen_index - 1) % len(temps)]
 
 
 def trim_by_alignment(audio: np.ndarray, sr: int, words: list[dict], keep_s: float = 0.25):
@@ -637,56 +703,177 @@ def qa_asr_words(result: dict) -> list[dict]:
     ]
 
 
+def _verdict_score(verdict: dict) -> tuple:
+    """Lower is better: fewer tail omissions, fewer omissions, lower CER."""
+    return (
+        0 if verdict["ok"] else 1,
+        len(verdict["tail"]),
+        len(verdict["missing"]),
+        verdict["cer"],
+    )
+
+
+def repair_tail(
+    raw: Path,
+    spoken_ref: str,
+    tail_words: list[str],
+    words: list[dict],
+    synth,
+    log_ctx: str,
+) -> bool:
+    """Last-resort fix for a truncated tail: re-speak the ending and append it.
+
+    Cuts the clip just before the last word Whisper actually heard, then
+    appends a freshly synthesized clip that re-speaks that word plus every
+    missing one. Only used when regeneration attempts still leave whole words
+    missing at the end. Returns True when the clip was modified.
+    """
+    ref_w = norm_words(spoken_ref)
+    if not ref_w or not words or not tail_words:
+        return False
+    n_tail = len(tail_words)
+    if n_tail > 4 or n_tail >= len(ref_w):
+        return False
+    starts = [
+        float(w["start"])
+        for w in words
+        if isinstance(w.get("start"), (int, float)) and math.isfinite(float(w["start"]))
+    ]
+    if not starts:
+        return False
+    spoken_words = spoken_ref.split()
+    if len(spoken_words) != len(ref_w):
+        return False
+    tail_text = " ".join(spoken_words[-(n_tail + 1):])
+    tail_dest = raw.with_name(raw.stem + ".tail.wav")
+    backup = raw.with_name(raw.stem + ".pre_repair.wav")
+    try:
+        synth(tail_text, tail_dest, 1)
+        if not usable_segment(tail_dest):
+            return False
+        main_audio, sr = load_mono(raw)
+        tail_audio, tail_sr = load_mono(tail_dest)
+        if tail_sr != sr:
+            return False
+        # Cut just before the last word the ASR actually heard; the fresh clip
+        # re-speaks it, so a clipped syllable is replaced rather than doubled.
+        cut = int(max(0.0, starts[-1]) * sr)
+        if cut >= len(main_audio) or cut < int(0.3 * len(main_audio)):
+            return False
+        shutil.copyfile(raw, backup)
+        onset = voiced_start(tail_audio, sr)
+        tail_clip = tail_audio[max(0, int(onset * sr) - int(0.02 * sr)) :]
+        gap = np.zeros(int(0.05 * sr), dtype=np.float32)
+        combined = np.concatenate(
+            [main_audio[:cut], gap, tail_clip.astype(np.float32)]
+        )
+        sf.write(str(raw), combined, sr)
+    except Exception as exc:
+        apple_device.log(f"QA {log_ctx} tail repair failed ({exc})")
+        return False
+    finally:
+        tail_dest.unlink(missing_ok=True)
+    apple_device.log(
+        f"QA {log_ctx} tail repair: re-spoke last {n_tail + 1} word(s), "
+        f"appended {len(tail_clip) / sr:.2f}s"
+    )
+    return True
+
+
+def revert_repair(raw: Path) -> None:
+    backup = raw.with_name(raw.stem + ".pre_repair.wav")
+    if backup.is_file():
+        backup.replace(raw)
+
+
 def qa_polish(
     raw: Path,
     text: str,
     args: argparse.Namespace,
     engine: str,
-    retry=None,
+    synth=None,
     log_ctx: str = "",
 ) -> Path:
-    """ASR-based per-cue QA: aligned end trim plus one retry on bad output.
+    """Verify-and-correct loop for one cue.
 
-    Transcribes the synthesized cue with mlx-whisper, trims everything after
-    the last recognized word (kills appended echo/reference artifacts), and
-    when the transcript is too far from the intended text re-synthesizes once
-    and keeps the better take.
+    For every generated take: transcribe with mlx-whisper, compare against the
+    spoken source text (CER, whole-word omissions, truncated tail, implausibly
+    short audio), trim trailing silence along the aligned words, and keep the
+    best take. Discrepancies trigger regeneration with a different sampling
+    temperature per attempt; if attempts still leave whole words missing at the
+    end, the missing ending is re-synthesized and appended.
     """
     if args.no_qa or engine == "piper":
         return raw
     repo = args.qa_model or args.whisper_model
+    attempts = max(1, int(args.qa_attempts))
+
+    def evaluate(path: Path) -> tuple[dict, list[dict]]:
+        result = qa_asr(path, repo)
+        hyp = str(result.get("text", ""))
+        gen_sec = float(sf.info(str(path)).duration)
+        verdict = assess_cue(text, hyp, gen_sec, args.qa_cer, args.qa_max_cps)
+        words = qa_asr_words(result)
+        if words and verdict["cer"] <= 0.5:
+            audio, sr = load_mono(path)
+            trimmed, changed = trim_by_alignment(audio, sr, words)
+            if changed:
+                sf.write(str(path), trimmed, sr)
+        return verdict, words
+
     try:
-        result = qa_asr(raw, repo)
+        verdict, words = evaluate(raw)
     except Exception as exc:
         apple_device.log(f"QA {log_ctx} unavailable ({exc}); keeping energy trim only")
         return raw
-    hyp = str(result.get("text", ""))
-    cer = char_error_rate(text, hyp)
-    words = qa_asr_words(result)
-    if needs_retry(text, hyp, args.qa_threshold) and retry is not None:
-        alt = raw.with_name(raw.stem + ".retry.wav")
+    attempts_used = 1
+    for attempt in range(2, attempts + 1):
+        if verdict["ok"] or synth is None:
+            break
+        cand = raw.with_name(f"{raw.stem}.qa{attempt}.wav")
         try:
-            retry(alt)
-            retry_result = qa_asr(alt, repo)
+            synth(text, cand, attempt - 1)
+            if not usable_segment(cand):
+                cand.unlink(missing_ok=True)
+                continue
+            cand_verdict, cand_words = evaluate(cand)
         except Exception as exc:
-            apple_device.log(f"QA {log_ctx} retry failed ({exc})")
-            alt.unlink(missing_ok=True)
+            apple_device.log(f"QA {log_ctx} attempt {attempt} failed ({exc})")
+            cand.unlink(missing_ok=True)
+            continue
+        if _verdict_score(cand_verdict) < _verdict_score(verdict):
+            apple_device.log(
+                f"QA {log_ctx} attempt {attempt} improved "
+                f"cer {verdict['cer']:.2f}->{cand_verdict['cer']:.2f} "
+                f"tail={len(cand_verdict['tail'])}"
+            )
+            cand.replace(raw)
+            verdict, words = cand_verdict, cand_words
         else:
-            retry_cer = char_error_rate(text, str(retry_result.get("text", "")))
-            if retry_cer < cer:
-                apple_device.log(f"QA {log_ctx} retry improved cer {cer:.2f}->{retry_cer:.2f}")
-                alt.replace(raw)
-                cer = retry_cer
-                result = retry_result
-                words = qa_asr_words(result)
+            cand.unlink(missing_ok=True)
+        attempts_used = attempt
+    if (
+        not verdict["ok"]
+        and verdict["tail"]
+        and synth is not None
+        and repair_tail(raw, text, verdict["tail"], words, synth, log_ctx)
+    ):
+        attempts_used += 1
+        try:
+            repaired, repaired_words = evaluate(raw)
+        except Exception as exc:
+            apple_device.log(f"QA {log_ctx} repair verify failed ({exc})")
+            repaired = None
+            if repaired is None or _verdict_score(repaired) > _verdict_score(verdict):
+                apple_device.log(f"QA {log_ctx} repair rejected; restoring previous take")
+                revert_repair(raw)
             else:
-                alt.unlink(missing_ok=True)
-    if words and cer <= 0.5:
-        audio, sr = load_mono(raw)
-        trimmed, changed = trim_by_alignment(audio, sr, words)
-        if changed:
-            sf.write(str(raw), trimmed, sr)
-    apple_device.log(f"QA {log_ctx} cer={cer:.2f} words={len(words)}")
+                verdict, words = repaired, repaired_words
+    apple_device.log(
+        f"QA {log_ctx} cer={verdict['cer']:.2f} "
+        f"tail={len(verdict['tail'])} missing={len(verdict['missing'])} "
+        f"attempts={attempts_used} ok={verdict['ok']}"
+    )
     return raw
 
 
@@ -1273,11 +1460,11 @@ def main() -> int:
                 continue
             if engine == "f5":
 
-                def retry(dest: Path, _text: str = text) -> None:
-                    f5_infer(tts, speaker, ref_text, _text, args, dest, tts_device)
+                def synth_f5(t: str, dest: Path, attempt: int = 1) -> None:
+                    f5_infer(tts, speaker, ref_text, t, args, dest, tts_device)
 
                 gen_sr = f5_infer(tts, speaker, ref_text, text, args, raw, tts_device)
-                raw = qa_polish(raw, text, args, engine, retry, f"cue {i}/{len(cues)}")
+                raw = qa_polish(raw, text, args, engine, synth_f5, f"cue {i}/{len(cues)}")
             else:
                 piper_to_wav(text, Path(args.piper_model), raw)
             samples = fit_cue_audio(
@@ -1319,10 +1506,10 @@ def main() -> int:
                     None,
                 )
 
-                def retry_pocket(
-                    dest: Path, _text: str = text, _spk: str | None = spk
+                def synth_pocket(
+                    t: str, dest: Path, attempt: int = 1, _spk: str | None = spk
                 ) -> None:
-                    job: dict = {"text": _text, "out": str(dest)}
+                    job: dict = {"text": t, "out": str(dest)}
                     if _spk:
                         job["speaker"] = _spk
                     pocket_batch(
@@ -1330,30 +1517,28 @@ def main() -> int:
                         [job],
                         args.pocket_config,
                         speaker,
-                        temperature=args.pocket_temperature,
+                        temperature=regen_temperature("pocket", attempt),
                     )
 
                 raw = qa_polish(
-                    raw, text, args, engine, retry_pocket, f"cue {_i}/{len(cues)}"
+                    raw, text, args, engine, synth_pocket, f"cue {_i}/{len(cues)}"
                 )
             elif engine == "xtts":
 
-                def retry_xtts(dest: Path, _text: str = text) -> None:
+                def synth_xtts(t: str, dest: Path, attempt: int = 1) -> None:
+                    job: dict = {"text": t, "out": str(dest)}
+                    temp = regen_temperature("xtts", attempt)
+                    if temp is not None:
+                        job["temperature"] = temp
                     coqui_batch(
                         Path(args.xtts_python) if args.xtts_python else Path(),
-                        [
-                            {
-                                "text": _text,
-                                "out": str(dest),
-                                "temperature": XTTS_RETRY_TEMPERATURE,
-                            }
-                        ],
+                        [job],
                         XTTS_MODEL,
                         speaker,
                     )
 
                 raw = qa_polish(
-                    raw, text, args, engine, retry_xtts, f"cue {_i}/{len(cues)}"
+                    raw, text, args, engine, synth_xtts, f"cue {_i}/{len(cues)}"
                 )
             samples = fit_cue_audio(
                 raw, fitted, slot, max_speed, tmp_dir, base_speed=base_speed

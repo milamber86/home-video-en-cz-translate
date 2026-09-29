@@ -218,11 +218,63 @@ def test_char_error_rate():
     assert sc.char_error_rate("Dobrý den", "dobrý den") == 0.0
 
 
-def test_needs_retry():
-    assert not sc.needs_retry("ahoj světe", "ahoj světe.", 0.45)
-    assert sc.needs_retry("ahoj světe", "", 0.45)
-    assert sc.needs_retry("ahoj světe", "úplně nesouvisející slova", 0.45)
-    assert sc.needs_retry("ahoj", "ahoj ahoj ahoj ahoj ahoj ahoj ahoj", 0.45)
+def test_tail_omissions_detects_missing_ending():
+    ref = ["dobrý", "den", "toto", "je", "zkouška"]
+    assert sc.tail_omissions(ref, ["dobrý", "den", "toto", "je"]) == ["zkouška"]
+    assert sc.tail_omissions(ref, ["dobrý", "den", "toto", "je", "zkouška"]) == []
+    assert sc.tail_omissions(ref, []) == ref
+
+
+def test_missing_words_finds_omissions_anywhere():
+    ref = ["ahoj", "světe", "jak", "se", "máš"]
+    assert sc.missing_words(ref, ["ahoj", "jak", "se", "máš"]) == ["světe"]
+    assert sc.missing_words(ref, ref) == []
+
+
+def test_assess_cue_accepts_matching_transcript():
+    v = sc.assess_cue("Dobrý den, toto je zkouška.", "Dobrý den, toto je zkouška.", 2.5, 0.15, 22.0)
+    assert v["ok"]
+    assert v["tail"] == []
+    assert not v["too_fast"]
+
+
+def test_assess_cue_flags_truncated_tail():
+    v = sc.assess_cue("Dobrý den, toto je zkouška řeči.", "Dobrý den, toto je zkouška", 2.0, 0.15, 22.0)
+    assert not v["ok"]
+    assert v["tail"] == ["řeči"]
+
+
+def test_assess_cue_flags_empty_and_too_fast():
+    v = sc.assess_cue("Dobrý den, toto je zkouška řeči.", "", 0.0, 0.15, 22.0)
+    assert not v["ok"] and v["empty"]
+    v = sc.assess_cue("Dobrý den, toto je zkouška řeči.", "Dobrý den toto je zkouška řeči", 0.2, 0.15, 22.0)
+    assert not v["ok"] and v["too_fast"]
+
+
+def test_assess_cue_aligns_digits_with_spoken_form():
+    v = sc.assess_cue(
+        "V roce devatenáct set sedmdesát šest to funguje.",
+        "V roce 1976 to funguje.",
+        4.0,
+        0.15,
+        22.0,
+    )
+    assert v["ok"]
+
+
+def test_regen_temperature_schedule():
+    assert sc.regen_temperature("pocket", 1) == 0.45
+    assert sc.regen_temperature("pocket", 2) == 0.2
+    assert sc.regen_temperature("pocket", 5) == 0.45
+    assert sc.regen_temperature("xtts", 1) == 0.45
+    assert sc.regen_temperature("piper", 1) is None
+    assert sc.regen_temperature("vits", 1) is None
+
+
+def test_verdict_score_prefers_ok_take():
+    good = sc.assess_cue("ahoj světe", "ahoj světe.", 1.0, 0.15, 22.0)
+    bad = sc.assess_cue("ahoj světe", "ahoj", 1.0, 0.15, 22.0)
+    assert sc._verdict_score(good) < sc._verdict_score(bad)
 
 
 def test_trim_by_alignment_keeps_voiced_tail():

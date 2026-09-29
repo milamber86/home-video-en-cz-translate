@@ -99,6 +99,21 @@ def voiced_end(audio, sr: int, frame_sec: float = 0.02, thr_ratio: float = 0.08)
     return min((last + 1) * frame_sec, len(audio) / float(sr))
 
 
+def voiced_start(audio, sr: int, frame_sec: float = 0.02, thr_ratio: float = 0.08) -> float:
+    """Seconds at which the first voiced frame starts (0.0 when voiced throughout)."""
+    import numpy as np
+
+    rms = frame_rms(audio, sr, frame_sec)
+    if rms.size == 0:
+        return 0.0
+    thr = max(float(np.max(rms)) * thr_ratio, 1e-4)
+    voiced = rms > thr
+    if not voiced.any():
+        return len(audio) / float(sr)
+    first = int(np.min(np.nonzero(voiced)[0]))
+    return first * frame_sec
+
+
 def cue_slot(cue, next_cue) -> float:
     """Fallback slot without vocal analysis: cue length plus bounded gap spill."""
     from srtutil import cue_seconds

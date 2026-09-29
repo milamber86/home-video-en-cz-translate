@@ -81,8 +81,13 @@ f5_nfe_step: 32
 # Cues with silence after them may spill into that gap before any speedup.
 tts_base_speed: 1.15
 tts_max_speed: 1.25
-# Per-cue ASR QA (mlx-whisper): aligned end trim + one retry on bad output.
+# Per-cue ASR QA (mlx-whisper) verify-and-correct loop: every take is
+# transcribed and compared against the spoken source text; discrepancies
+# trigger up to tts_qa_attempts regenerations with varying sampling, and a
+# still-missing ending is re-synthesized and appended.
 tts_qa: true
+tts_qa_attempts: 3
+tts_qa_cer: 0.15
 f5_ckpt_dir: "{{ playbook_dir }}/models/f5_czech"
 tts_engine: auto
 

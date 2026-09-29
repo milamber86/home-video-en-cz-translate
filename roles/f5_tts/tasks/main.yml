@@ -131,7 +131,7 @@
     tts_fresh_args: "{{ ['--fresh'] if (tts_fresh | default(false) | bool) else [] }}"
     tts_bundled_ref_args: "{{ ['--ref-audio', voice_ref_wav, '--ref-text', voice_ref_text] if voice_mode == 'bundled' else [] }}"
     tts_pocket_args: "{{ ['--pocket-python', pocket_python, '--pocket-config', pocket_config] if (pocket_python | default('') is file) else [] }}"
-    tts_qa_args: "{{ ['--no-qa'] if not (tts_qa | default(true) | bool) else [] }}"
+    tts_qa_args: "{{ (['--no-qa'] if not (tts_qa | default(true) | bool) else []) + ['--qa-attempts', (tts_qa_attempts | default(3) | string), '--qa-cer', (tts_qa_cer | default(0.15) | string)] }}"
   environment: "{{ pytorch_env }}"
   register: tts_synth
   failed_when: tts_synth.rc != 0
